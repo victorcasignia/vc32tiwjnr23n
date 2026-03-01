@@ -1,0 +1,71 @@
+model:
+  name: "dcno"
+  in_channels: 3
+  out_channels: 3
+  hidden_dims: [96, 192, 384, 768]
+  depths: [2, 3, 6, 3]
+  dct_block_size: 8
+  transform_type: "dct"    # "dct" or "dwt"
+  num_heads: 12
+  mode_weighting: true
+  dropout: 0.0
+  scale_factor: 4
+
+diffusion:
+  type: "rectified_flow"
+  num_train_timesteps: 1000
+  num_inference_steps: 8
+  beta_schedule: "linear"
+  prediction_type: "velocity"
+  consistency_training: false
+  consistency_steps: 1
+  ode_solver: "midpoint"
+
+training:
+  epochs: 600
+  batch_size: 8
+  accumulation_steps: 4
+  learning_rate: 1.5e-4
+  weight_decay: 0.01
+  optimizer: "adamw"
+  muon_momentum: 0.95
+  sgd_momentum: 0.9
+  nesterov: true
+  ema_decay: 0.9999
+  gradient_clip: 1.0
+  mixed_precision: true
+  scheduler:
+    type: "cosine"
+    warmup_steps: 3000
+    min_lr: 1.0e-6
+    T_max: null
+  early_stopping:
+    enabled: true
+    patience: 50
+    min_delta: 0.0
+
+data:
+  train_dataset: "df2k"            # DIV2K + Flickr2K
+  val_dataset: "div2k"
+  test_datasets: ["set5", "set14", "bsd100", "urban100"]
+  data_dir: "./data"
+  patch_size: 192
+  augment: true
+  num_workers: 8
+  pin_memory: true
+  # subset: 0.1                    # uncomment to use 10% of data for quick convergence test
+
+logging:
+  project: "dcno-super-resolution"
+  run_name: "dcno-df2k-x4-large"
+  log_interval: 100
+  val_start_epoch: 200
+  val_interval: 5
+  save_interval: 10
+  sample_interval: 5
+
+checkpoint:
+  dir: "./checkpoints"
+  save_best: true
+  save_last: true
+  max_keep: 5

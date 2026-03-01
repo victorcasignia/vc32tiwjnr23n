@@ -1,0 +1,33 @@
+# ------------------------------
+# Data / datasets (large, local)
+# ------------------------------
+**/data/
+**/data/**
+**/datasets/
+**/datasets/**
+
+# ------------------------------
+# Experiment outputs / run logs
+# ------------------------------
+**/wandb/
+**/runs/
+**/checkpoints/
+**/logs/
+**/outputs/
+
+# ------------------------------
+# Python cache / bytecode
+# ------------------------------
+**/__pycache__/
+**/*.py[cod]
+
+# ------------------------------
+# Jupyter / local artifacts
+# ------------------------------
+.ipynb_checkpoints/
+*.sqlite3
+
+# ------------------------------
+# Generic logs
+# ------------------------------
+*.log
