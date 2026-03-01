@@ -77,6 +77,8 @@ class SRPairedDataset(Dataset):
             hr, lr = self._random_crop(hr, lr)
             if self.augment:
                 hr, lr = self._augment(hr, lr)
+        else:
+            hr, lr = self._center_crop(hr, lr)
 
         return hr, lr
 
@@ -109,6 +111,29 @@ class SRPairedDataset(Dataset):
         lr = lr[:, top_lr : top_lr + lr_ps, left_lr : left_lr + lr_ps]
         hr = hr[:, top_hr : top_hr + ps, left_hr : left_hr + ps]
 
+        return hr, lr
+
+    def _center_crop(self, hr: torch.Tensor, lr: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Center crop at HR resolution, corresponding crop at LR."""
+        _, h, w = hr.shape
+        ps = self.patch_size
+        s = self.scale_factor
+        lr_ps = ps // s
+        _, lh, lw = lr.shape
+        if lh < lr_ps or lw < lr_ps:
+            lr = torch.nn.functional.interpolate(
+                lr.unsqueeze(0), size=(lr_ps, lr_ps), mode="bicubic", align_corners=False
+            ).squeeze(0).clamp(0, 1)
+            hr = torch.nn.functional.interpolate(
+                hr.unsqueeze(0), size=(ps, ps), mode="bicubic", align_corners=False
+            ).squeeze(0).clamp(0, 1)
+            return hr, lr
+        top_lr = (lh - lr_ps) // 2
+        left_lr = (lw - lr_ps) // 2
+        top_hr = top_lr * s
+        left_hr = left_lr * s
+        lr = lr[:, top_lr : top_lr + lr_ps, left_lr : left_lr + lr_ps]
+        hr = hr[:, top_hr : top_hr + ps, left_hr : left_hr + ps]
         return hr, lr
 
     def _augment(self, hr: torch.Tensor, lr: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -164,6 +189,9 @@ class SRSyntheticDataset(Dataset):
             hr = self._random_crop_hr(hr)
             if self.augment:
                 hr = self._augment_single(hr)
+        else:
+            # Center crop for validation (enables batching)
+            hr = self._center_crop_hr(hr)
 
         # Create LR by bicubic downsampling
         s = self.scale_factor
@@ -187,6 +215,19 @@ class SRSyntheticDataset(Dataset):
             return hr
         top = random.randint(0, h - ps)
         left = random.randint(0, w - ps)
+        return hr[:, top : top + ps, left : left + ps]
+
+    def _center_crop_hr(self, hr: torch.Tensor) -> torch.Tensor:
+        """Center crop HR for deterministic validation patches."""
+        _, h, w = hr.shape
+        ps = self.patch_size
+        if h < ps or w < ps:
+            hr = torch.nn.functional.interpolate(
+                hr.unsqueeze(0), size=(ps, ps), mode="bicubic", align_corners=False
+            ).squeeze(0).clamp(0, 1)
+            return hr
+        top = (h - ps) // 2
+        left = (w - ps) // 2
         return hr[:, top : top + ps, left : left + ps]
 
     def _augment_single(self, x: torch.Tensor) -> torch.Tensor:

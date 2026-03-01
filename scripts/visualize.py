@@ -58,6 +58,10 @@ def main():
         "hidden_dims": [64, 128, 256, 512], "depths": [2, 2, 4, 2],
         "dct_block_size": 8, "num_heads": 8, "mode_weighting": True,
         "scale_factor": scale, "dropout": 0.0, "transform_type": "dct",
+        "residual_learning": False, "spectral_conv_size": 1,
+        "spatial_dual_path": False, "freq_norm": False,
+        "progressive_stem": False, "concat_cond": False,
+        "input_proj": False,
     }
     if cfg:
         for k in model_kwargs:
@@ -75,6 +79,9 @@ def main():
     model.eval()
 
     flow = RectifiedFlow(num_inference_steps=args.steps)
+    residual_learning = False
+    if cfg:
+        residual_learning = cfg["model"].get("residual_learning", False)
 
     # Process images
     to_tensor = transforms.ToTensor()
@@ -104,7 +111,15 @@ def main():
         W_pad = ((W + block - 1) // block) * block
 
         with torch.no_grad():
-            sr = flow.sample(model, lr, shape=(1, 3, H_pad, W_pad), device=device)
+            x_bicubic = None
+            if residual_learning:
+                x_bicubic = F.interpolate(
+                    lr, size=(H_pad, W_pad), mode="bicubic", align_corners=False
+                )
+            sr = flow.sample(
+                model, lr, shape=(1, 3, H_pad, W_pad), device=device,
+                x_bicubic=x_bicubic,
+            )
         sr = sr[:, :, :H, :W].clamp(0, 1)
 
         # Upsample LR for comparison

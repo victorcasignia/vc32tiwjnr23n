@@ -20,6 +20,90 @@ from .dwt import BlockDWT2d, BlockIDWT2d
 # Building blocks
 # ---------------------------------------------------------------------------
 
+
+class FreqNorm(nn.Module):
+    """
+    Learnable per-channel affine normalization for spectral coefficients.
+
+    DCT coefficients have wildly different magnitudes across frequency bands
+    (DC is ~block_size× larger than high-freq AC).  This layer applies a
+    data-driven normalisation so the downstream stem sees uniform-scale
+    features across all spectral channels.
+
+    Uses running statistics computed during training (like BatchNorm) but
+    normalises per-channel only, not across the batch — this avoids the
+    diffusion-timestep-dependent distribution shift that makes standard
+    BatchNorm problematic for diffusion models.
+    """
+
+    def __init__(self, num_channels: int):
+        super().__init__()
+        self.norm = nn.GroupNorm(1, num_channels)  # LayerNorm equivalent
+        # Extra learnable scale/shift to recover representational power
+        self.gamma = nn.Parameter(torch.ones(1, num_channels, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, num_channels, 1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.norm(x) * self.gamma + self.beta
+
+
+def _gn(ch: int) -> nn.GroupNorm:
+    """GroupNorm with largest valid num_groups <= 32."""
+    g = min(32, ch)
+    while ch % g != 0:
+        g -= 1
+    return nn.GroupNorm(g, ch)
+
+
+class ProgressiveStem(nn.Module):
+    """
+    Multi-layer projection from spectral channels to hidden dim.
+
+    Avoids the harsh 1-layer compression (e.g. 768→64 with block_size=16)
+    that destroys spectral information.  Uses two intermediate layers with
+    GroupNorm + SiLU activation and a residual shortcut when shapes match.
+    """
+
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        mid = max(out_ch, (in_ch + out_ch) // 2)
+        self.layers = nn.Sequential(
+            nn.Conv2d(in_ch, mid, 3, padding=1),
+            _gn(mid),
+            nn.SiLU(),
+            nn.Conv2d(mid, out_ch, 3, padding=1),
+            _gn(out_ch),
+            nn.SiLU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layers(x)
+
+
+class ProgressiveHead(nn.Module):
+    """
+    Multi-layer projection from hidden dim back to spectral channels.
+
+    Mirror of :class:`ProgressiveStem` — gradually expands from hidden_dim
+    to spec_channels at the output of the U-Net.
+    """
+
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        mid = max(in_ch, (in_ch + out_ch) // 2)
+        self.layers = nn.Sequential(
+            _gn(in_ch),
+            nn.SiLU(),
+            nn.Conv2d(in_ch, mid, 3, padding=1),
+            _gn(mid),
+            nn.SiLU(),
+            nn.Conv2d(mid, out_ch, 3, padding=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layers(x)
+
+
 class SinusoidalTimestepEmbedding(nn.Module):
     """Sinusoidal positional embedding for diffusion timestep."""
 
@@ -83,17 +167,28 @@ class DCTSpectralConv(nn.Module):
     Spectral convolution in DCT coefficient space.
     
     Learns per-mode weights that rebalance the importance of each DCT
-    frequency, then applies a pointwise 1×1 convolution for channel mixing.
-    This is the DCT analog of Fourier Neural Operator's spectral convolution.
+    frequency, then applies a convolution for channel mixing.
+    
+    With ``kernel_size=1`` (default) this is a pointwise mix — each block's
+    coefficients are processed independently.  With ``kernel_size=3`` the conv
+    spans neighbouring blocks, enabling cross-block frequency reasoning.
     """
 
-    def __init__(self, in_channels: int, out_channels: int, mode_weighting: bool = True):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        mode_weighting: bool = True,
+        kernel_size: int = 1,
+    ):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
 
-        # Pointwise convolution for channel mixing
-        self.conv = nn.Conv2d(in_channels, out_channels, 1)
+        # Convolution for channel mixing (1×1 or 3×3)
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size, padding=kernel_size // 2
+        )
 
         # Adaptive mode weighting: learnable per-channel importance
         if mode_weighting:
@@ -126,6 +221,32 @@ class ChannelMLP(nn.Module):
         return self.net(x)
 
 
+class SpatialBlock(nn.Module):
+    """
+    Depthwise-separable 3×3 conv for cross-block spatial reasoning.
+
+    In spectral feature space, adjacent spatial positions correspond to
+    neighbouring blocks, so a 3×3 conv introduces inter-block coherence
+    without leaving the spectral domain.
+    """
+
+    def __init__(self, dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.dw_conv = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
+        self.pw_conv = nn.Conv2d(dim, dim, 1)
+        self.norm = nn.GroupNorm(min(32, dim), dim)
+        self.act = nn.SiLU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm(x)
+        h = self.dw_conv(h)
+        h = self.act(h)
+        h = self.pw_conv(h)
+        h = self.dropout(h)
+        return x + h
+
+
 # ---------------------------------------------------------------------------
 # DCNO Block — single operator layer
 # ---------------------------------------------------------------------------
@@ -134,6 +255,7 @@ class DCNOBlock(nn.Module):
     """
     One DCT Neural Operator block:
       AdaGN → DCTSpectralConv → SiLU → AdaGN → ChannelMLP → residual
+      (optional) → SpatialBlock for cross-block coherence
     """
 
     def __init__(
@@ -143,6 +265,8 @@ class DCNOBlock(nn.Module):
         num_heads: int = 8,
         mode_weighting: bool = True,
         dropout: float = 0.0,
+        spectral_conv_size: int = 1,
+        spatial_dual_path: bool = False,
     ):
         super().__init__()
         # Time projection
@@ -150,12 +274,19 @@ class DCNOBlock(nn.Module):
 
         # Spectral path
         self.norm1 = AdaptiveGroupNorm(dim)
-        self.spectral_conv = DCTSpectralConv(dim, dim, mode_weighting)
+        self.spectral_conv = DCTSpectralConv(
+            dim, dim, mode_weighting, kernel_size=spectral_conv_size,
+        )
         self.act = nn.SiLU()
 
         # Channel MLP path
         self.norm2 = AdaptiveGroupNorm(dim)
         self.channel_mlp = ChannelMLP(dim, expansion=4, dropout=dropout)
+
+        # Optional spatial dual path
+        self.spatial_block = (
+            SpatialBlock(dim, dropout=dropout) if spatial_dual_path else None
+        )
 
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         scale, shift = self.time_mlp(t_emb)
@@ -170,6 +301,10 @@ class DCNOBlock(nn.Module):
         h = self.norm2(x, scale, shift)
         h = self.channel_mlp(h)
         x = x + h
+
+        # Spatial cross-block path (if enabled)
+        if self.spatial_block is not None:
+            x = self.spatial_block(x)
 
         return x
 
@@ -259,6 +394,31 @@ class DCNO(nn.Module):
         scale_factor:  Super-resolution scale (2, 3, 4, etc.)
         dropout:       Dropout rate
         transform_type: Spectral transform — ``"dct"`` (default) or ``"dwt"``
+        residual_learning: If ``True`` the model predicts the *residual*
+            ``x_hr − bicubic(x_lr)`` instead of ``x_hr`` directly.  Reduces
+            the energy the diffusion process must learn by 3-5×.
+        spectral_conv_size: Kernel size for
+            :class:`DCTSpectralConv` (1 = pointwise, 3 = cross-block).
+        spatial_dual_path: Append a lightweight depthwise-separable 3×3
+            :class:`SpatialBlock` inside every :class:`DCNOBlock` for
+            cross-block spatial coherence.
+        freq_norm: Apply :class:`FreqNorm` (learnable per-channel
+            normalisation) to spectral coefficients before the stem.
+            Equalises the vastly different scales of DC vs AC coefficients.
+        progressive_stem: Use :class:`ProgressiveStem` /
+            :class:`ProgressiveHead` instead of single Conv2d for the
+            stem / head projection.  Avoids the harsh N→hidden_dim
+            compression when ``dct_block_size`` is large.
+        concat_cond: If ``True``, concatenate the LR spectral coefficients
+            with x_t spectral coefficients channel-wise before the stem
+            (input channels = 2 × spec_channels).  This is the standard
+            SR3/SRDiff approach and prevents the model from learning a
+            shortcut through a separate condition encoder that ignores x_t.
+        input_proj: If ``True``, add a pixel-space projection of x_t
+            (Conv2d with stride=block_size) that is added to the spectral
+            stem output.  This gives the model a direct pixel-space pathway
+            to access x_t, bypassing the DCT transform which scrambles the
+            spatial noise structure.  Critical for learning denoising.
     """
 
     def __init__(
@@ -273,6 +433,13 @@ class DCNO(nn.Module):
         scale_factor: int = 4,
         dropout: float = 0.0,
         transform_type: str = "dct",
+        residual_learning: bool = False,
+        spectral_conv_size: int = 1,
+        spatial_dual_path: bool = False,
+        freq_norm: bool = False,
+        progressive_stem: bool = False,
+        concat_cond: bool = False,
+        input_proj: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -280,6 +447,9 @@ class DCNO(nn.Module):
         self.scale_factor = scale_factor
         self.dct_block_size = dct_block_size
         self.transform_type = transform_type
+        self.residual_learning = residual_learning
+        self.concat_cond = concat_cond
+        self.use_input_proj = input_proj
 
         n = dct_block_size
         num_down = len(hidden_dims) - 1  # number of spatial downsamples
@@ -309,11 +479,35 @@ class DCNO(nn.Module):
             nn.Linear(time_dim, time_dim),
         )
 
+        # Optional frequency normalization
+        self.freq_norm = FreqNorm(spec_channels) if freq_norm else None
+
         # Stem: spectral coefficients → hidden
-        self.stem = nn.Conv2d(spec_channels, hidden_dims[0], 3, padding=1)
+        stem_in_ch = spec_channels * 2 if concat_cond else spec_channels
+        if progressive_stem:
+            self.stem = ProgressiveStem(stem_in_ch, hidden_dims[0])
+        else:
+            self.stem = nn.Conv2d(stem_in_ch, hidden_dims[0], 3, padding=1)
 
         # LR condition encoder (operates on LR spectral coefficients)
-        self.cond_encoder = ConditionEncoder(spec_channels, hidden_dims)
+        # Skipped when concat_cond is on — LR is concatenated at input level.
+        if not concat_cond:
+            self.cond_encoder = ConditionEncoder(spec_channels, hidden_dims)
+        else:
+            self.cond_encoder = None
+
+        # Pixel-space projection of x_t (bypasses DCT bottleneck for denoising).
+        # Uses stride=block_size to match the spatial resolution of spectral
+        # features (H/n × W/n) produced by the DCT transform.
+        if input_proj:
+            self.input_proj = nn.Sequential(
+                nn.Conv2d(in_channels, hidden_dims[0], kernel_size=n, stride=n),
+                _gn(hidden_dims[0]),
+                nn.SiLU(),
+                nn.Conv2d(hidden_dims[0], hidden_dims[0], 3, padding=1),
+            )
+        else:
+            self.input_proj = None
 
         # ---- Encoder ----
         self.encoder_blocks = nn.ModuleList()
@@ -323,7 +517,11 @@ class DCNO(nn.Module):
             stage_blocks = nn.ModuleList()
             for _ in range(depth):
                 stage_blocks.append(
-                    DCNOBlock(dim, time_dim, num_heads, mode_weighting, dropout)
+                    DCNOBlock(
+                        dim, time_dim, num_heads, mode_weighting, dropout,
+                        spectral_conv_size=spectral_conv_size,
+                        spatial_dual_path=spatial_dual_path,
+                    )
                 )
             self.encoder_blocks.append(stage_blocks)
             
@@ -332,8 +530,16 @@ class DCNO(nn.Module):
 
         # ---- Bottleneck ----
         self.bottleneck = nn.ModuleList([
-            DCNOBlock(hidden_dims[-1], time_dim, num_heads, mode_weighting, dropout),
-            DCNOBlock(hidden_dims[-1], time_dim, num_heads, mode_weighting, dropout),
+            DCNOBlock(
+                hidden_dims[-1], time_dim, num_heads, mode_weighting, dropout,
+                spectral_conv_size=spectral_conv_size,
+                spatial_dual_path=spatial_dual_path,
+            ),
+            DCNOBlock(
+                hidden_dims[-1], time_dim, num_heads, mode_weighting, dropout,
+                spectral_conv_size=spectral_conv_size,
+                spatial_dual_path=spatial_dual_path,
+            ),
         ])
 
         # ---- Decoder ----
@@ -354,7 +560,11 @@ class DCNO(nn.Module):
             stage_blocks = nn.ModuleList()
             for _ in range(depth):
                 stage_blocks.append(
-                    DCNOBlock(dim, time_dim, num_heads, mode_weighting, dropout)
+                    DCNOBlock(
+                        dim, time_dim, num_heads, mode_weighting, dropout,
+                        spectral_conv_size=spectral_conv_size,
+                        spatial_dual_path=spatial_dual_path,
+                    )
                 )
             self.decoder_blocks.append(stage_blocks)
 
@@ -362,11 +572,14 @@ class DCNO(nn.Module):
                 self.upsamples.append(Upsample(dim, rev_dims[i + 1]))
 
         # Head: hidden → DCT coefficients (same spatial resolution as input)
-        self.head = nn.Sequential(
-            nn.GroupNorm(min(32, hidden_dims[0]), hidden_dims[0]),
-            nn.SiLU(),
-            nn.Conv2d(hidden_dims[0], spec_channels, 3, padding=1),
-        )
+        if progressive_stem:
+            self.head = ProgressiveHead(hidden_dims[0], spec_channels)
+        else:
+            self.head = nn.Sequential(
+                nn.GroupNorm(min(32, hidden_dims[0]), hidden_dims[0]),
+                nn.SiLU(),
+                nn.Conv2d(hidden_dims[0], spec_channels, 3, padding=1),
+            )
 
         self._init_weights()
 
@@ -410,20 +623,45 @@ class DCNO(nn.Module):
         x_spec = self.fwd_transform(x_t)           # (B, C*n^2, H/n, W/n)
         lr_spec = self.fwd_transform(x_lr_padded)  # (B, C*n^2, H_lr/n, W_lr/n)
 
+        # --- Optional frequency normalization ---
+        if self.freq_norm is not None:
+            x_spec = self.freq_norm(x_spec)
+            lr_spec = self.freq_norm(lr_spec)
+
         # --- Time embedding ---
         t_emb = self.time_embed(t)      # (B, time_dim)
 
-        # --- LR condition features ---
-        cond_feats = self.cond_encoder(lr_spec)  # multi-scale list
+        # --- LR conditioning ---
+        if self.concat_cond:
+            # Concatenate LR spectral coefficients with x_t along channels
+            if lr_spec.shape[-2:] != x_spec.shape[-2:]:
+                lr_spec = F.interpolate(
+                    lr_spec, size=x_spec.shape[-2:],
+                    mode="bilinear", align_corners=False,
+                )
+            x_spec = torch.cat([x_spec, lr_spec], dim=1)  # (B, 2*C*n^2, ...)
+            cond_feats = None
+        else:
+            cond_feats = self.cond_encoder(lr_spec)  # multi-scale list
 
         # --- Stem ---
         h = self.stem(x_spec)            # (B, hidden_dims[0], H/n, W/n)
 
+        # --- Pixel-space x_t projection (bypass DCT for denoising) ---
+        if self.input_proj is not None:
+            h_pixel = self.input_proj(x_t)
+            if h_pixel.shape[-2:] != h.shape[-2:]:
+                h_pixel = F.interpolate(
+                    h_pixel, size=h.shape[-2:],
+                    mode="bilinear", align_corners=False,
+                )
+            h = h + h_pixel
+
         # --- Encoder ---
         skip_connections = []
         for i, stage_blocks in enumerate(self.encoder_blocks):
-            # Add LR conditioning at matching scale
-            if i < len(cond_feats):
+            # Add LR conditioning at matching scale (only if not concat_cond)
+            if cond_feats is not None and i < len(cond_feats):
                 cond = cond_feats[i]
                 # Resize cond to match h if needed
                 if cond.shape[-2:] != h.shape[-2:]:

@@ -10,6 +10,14 @@ model:
   mode_weighting: true
   dropout: 0.0
   scale_factor: 2
+  # --- ablation flags ---
+  residual_learning: false          # diffuse (HR - bicubic(LR)) instead of HR
+  spectral_conv_size: 1             # 1 = pointwise, 3 = cross-block spectral conv
+  spatial_dual_path: false          # add depthwise-sep 3×3 spatial block per DCNOBlock
+  freq_norm: false                  # learnable per-channel spectral normalisation
+  progressive_stem: false           # multi-layer stem/head to ease spectral compression
+  concat_cond: false                 # concatenate LR with x_t at input (standard SR3 approach)
+  input_proj: false                  # pixel-space x_t projection (bypasses DCT for denoising)
 
 diffusion:
   type: "rectified_flow"

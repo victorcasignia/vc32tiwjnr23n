@@ -155,6 +155,7 @@ def evaluate_dataset(
     ode_solver: str = "euler",
     save_dir: Optional[str] = None,
     lpips_fn=None,
+    residual_learning: bool = False,
 ) -> Dict[str, float]:
     """Evaluate model on a benchmark dataset."""
     model.eval()
@@ -187,7 +188,15 @@ def evaluate_dataset(
 
         # Generate SR
         target_shape = (B, C, H_hr_pad, W_hr_pad)
-        sr = flow.sample(model, lr, shape=target_shape, num_steps=num_steps, device=device)
+        x_bicubic = None
+        if residual_learning:
+            x_bicubic = F.interpolate(
+                lr, size=(H_hr_pad, W_hr_pad), mode="bicubic", align_corners=False
+            )
+        sr = flow.sample(
+            model, lr, shape=target_shape, num_steps=num_steps,
+            device=device, x_bicubic=x_bicubic,
+        )
         sr = sr[:, :, :H_hr, :W_hr]  # crop to original HR size
 
         t_elapsed = time.time() - t_start
@@ -232,6 +241,7 @@ def single_image_sr(
     scale_factor: int,
     device: torch.device,
     num_steps: int = 10,
+    residual_learning: bool = False,
 ):
     """Super-resolve a single image."""
     from torchvision import transforms
@@ -256,8 +266,17 @@ def single_image_sr(
     log.info("Input: %d×%d → Output: %d×%d", H, W, H_hr, W_hr)
     log.info("Running %d-step ODE sampling...", num_steps)
 
+    x_bicubic = None
+    if residual_learning:
+        x_bicubic = F.interpolate(
+            lr, size=(H_pad, W_pad), mode="bicubic", align_corners=False
+        )
+
     t0 = time.time()
-    sr = flow.sample(model, lr, shape=(1, 3, H_pad, W_pad), num_steps=num_steps, device=device, show_progress=True)
+    sr = flow.sample(
+        model, lr, shape=(1, 3, H_pad, W_pad), num_steps=num_steps,
+        device=device, show_progress=True, x_bicubic=x_bicubic,
+    )
     sr = sr[:, :, :H_hr, :W_hr].clamp(0, 1)
     elapsed = time.time() - t0
 
@@ -329,6 +348,13 @@ def main():
         scale_factor=scale,
         dropout=0.0,
         transform_type=cfg["model"].get("transform_type", "dct"),
+        residual_learning=cfg["model"].get("residual_learning", False),
+        spectral_conv_size=cfg["model"].get("spectral_conv_size", 1),
+        spatial_dual_path=cfg["model"].get("spatial_dual_path", False),
+        freq_norm=cfg["model"].get("freq_norm", False),
+        progressive_stem=cfg["model"].get("progressive_stem", False),
+        concat_cond=cfg["model"].get("concat_cond", False),
+        input_proj=cfg["model"].get("input_proj", False),
     ).to(device)
 
     # Load weights (EMA if available)
@@ -359,9 +385,14 @@ def main():
         except ImportError:
             log.info("  LPIPS: disabled (install with: pip install lpips)")
 
+    residual_learning = cfg["model"].get("residual_learning", False)
+
     # ---- Single image mode ----
     if args.input:
-        single_image_sr(model, flow, args.input, args.output, scale, device, num_steps)
+        single_image_sr(
+            model, flow, args.input, args.output, scale, device,
+            num_steps, residual_learning=residual_learning,
+        )
         return
 
     # ---- Benchmark evaluation ----
@@ -377,6 +408,7 @@ def main():
                 model, flow, ds_name, data_dir, scale, device,
                 num_steps=num_steps, ode_solver=solver,
                 save_dir=args.save_dir, lpips_fn=lpips_fn,
+                residual_learning=residual_learning,
             )
             all_results[ds_name] = results
 

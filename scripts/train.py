@@ -89,6 +89,13 @@ def build_model(cfg: dict) -> DCNO:
         scale_factor=mcfg.get("scale_factor", 4),
         dropout=mcfg.get("dropout", 0.0),
         transform_type=mcfg.get("transform_type", "dct"),
+        residual_learning=mcfg.get("residual_learning", False),
+        spectral_conv_size=mcfg.get("spectral_conv_size", 1),
+        spatial_dual_path=mcfg.get("spatial_dual_path", False),
+        freq_norm=mcfg.get("freq_norm", False),
+        progressive_stem=mcfg.get("progressive_stem", False),
+        concat_cond=mcfg.get("concat_cond", False),
+        input_proj=mcfg.get("input_proj", False),
     )
 
 
@@ -210,6 +217,7 @@ def validate(
     model.eval()
     scale = cfg["model"].get("scale_factor", 4)
     num_steps = cfg["diffusion"].get("num_inference_steps", 10)
+    residual_learning = cfg["model"].get("residual_learning", False)
 
     total_psnr = 0.0
     count = 0
@@ -219,8 +227,17 @@ def validate(
         hr, lr = hr.to(device), lr.to(device)
         B, C, H_hr, W_hr = hr.shape
 
+        # Bicubic upsampled LR (used for residual learning & visualisation)
+        lr_up = F.interpolate(
+            lr, size=(H_hr, W_hr), mode="bicubic", align_corners=False
+        )
+        x_bicubic = lr_up if residual_learning else None
+
         # Generate SR via ODE sampling
-        sr = flow.sample(model, lr, shape=hr.shape, num_steps=num_steps, device=device)
+        sr = flow.sample(
+            model, lr, shape=hr.shape, num_steps=num_steps,
+            device=device, x_bicubic=x_bicubic,
+        )
 
         # PSNR
         for b in range(B):
@@ -230,12 +247,8 @@ def validate(
         # Collect samples for visualization
         if len(sample_images) < num_samples:
             for b in range(min(B, num_samples - len(sample_images))):
-                # Upsample LR for side-by-side
-                lr_up = F.interpolate(
-                    lr[b:b+1], size=(H_hr, W_hr), mode="bicubic", align_corners=False
-                ).clamp(0, 1)
                 sample_images.append({
-                    "lr": lr_up[0].cpu(),
+                    "lr": lr_up[b:b+1].clamp(0, 1)[0].cpu(),
                     "sr": sr[b].cpu().clamp(0, 1),
                     "hr": hr[b].cpu(),
                 })
@@ -302,13 +315,15 @@ def train(cfg: dict, args):
         drop_last=True,
         persistent_workers=_nw > 0,
     )
+    val_batch_size = tcfg.get("val_batch_size", 1)
     val_loader = DataLoader(
         val_ds,
-        batch_size=1,  # val images have different sizes, can't collate >1
+        batch_size=val_batch_size,
         shuffle=False,
         num_workers=_nw,
         pin_memory=_pin,
         persistent_workers=_nw > 0,
+        drop_last=val_batch_size > 1,
     )
 
     # ---- Model ----
@@ -323,6 +338,14 @@ def train(cfg: dict, args):
         num_inference_steps=diff_cfg.get("num_inference_steps", 10),
         prediction_type=diff_cfg.get("prediction_type", "velocity"),
         ode_solver=diff_cfg.get("ode_solver", "euler"),
+        lr_init=diff_cfg.get("lr_init", False),
+        t_max=diff_cfg.get("t_max", 0.8),
+        freq_weighted_loss=diff_cfg.get("freq_weighted_loss", False),
+        freq_loss_alpha=diff_cfg.get("freq_loss_alpha", 2.0),
+        dct_block_size=cfg["model"].get("dct_block_size", 8),
+        timestep_sampling=diff_cfg.get("timestep_sampling", "uniform"),
+        logit_mean=diff_cfg.get("logit_mean", 0.0),
+        logit_std=diff_cfg.get("logit_std", 1.0),
     )
 
     consistency_trainer = None
@@ -363,7 +386,23 @@ def train(cfg: dict, args):
     lcfg = cfg.get("logging", {})
     diff_type = diff_cfg.get("type", "rectified_flow")
     transform_type = cfg["model"].get("transform_type", "dct")
-    auto_run_name = f"dcno-x{scale}-{optimizer_name}-{diff_type}-{transform_type}"
+    # Build descriptive run name including ablation flags
+    ablation_tags = []
+    if cfg["model"].get("residual_learning", False):
+        ablation_tags.append("res")
+    if diff_cfg.get("lr_init", False):
+        ablation_tags.append("lrinit")
+    if diff_cfg.get("freq_weighted_loss", False):
+        ablation_tags.append("fwl")
+    if diff_cfg.get("timestep_sampling", "uniform") != "uniform":
+        ablation_tags.append("logit")
+    if cfg["model"].get("spatial_dual_path", False):
+        ablation_tags.append("spatial")
+    sc_size = cfg["model"].get("spectral_conv_size", 1)
+    if sc_size > 1:
+        ablation_tags.append(f"sc{sc_size}")
+    ablation_suffix = "-" + "+".join(ablation_tags) if ablation_tags else ""
+    auto_run_name = f"dcno-x{scale}-{optimizer_name}-{diff_type}-{transform_type}{ablation_suffix}"
     if HAS_WANDB and not args.no_wandb:
         wandb.init(
             project=lcfg.get("project", "dcno-super-resolution"),
@@ -391,10 +430,26 @@ def train(cfg: dict, args):
     if subset_frac:
         log.info("  Subset: %.1f%% of data (train: %d, val: %d)", subset_frac * 100, len(train_ds), len(val_ds))
 
+    residual_learning = cfg["model"].get("residual_learning", False)
+    if residual_learning:
+        log.info("  Residual learning: ON (diffusing HR - bicubic(LR))")
+    if diff_cfg.get("lr_init", False):
+        log.info("  LR-init sampling: ON (t_max=%.2f)", diff_cfg.get("t_max", 0.8))
+    if diff_cfg.get("freq_weighted_loss", False):
+        log.info("  Freq-weighted loss: ON (alpha=%.1f)", diff_cfg.get("freq_loss_alpha", 2.0))
+    if diff_cfg.get("timestep_sampling", "uniform") != "uniform":
+        log.info("  Timestep sampling: %s (mean=%.1f, std=%.1f)",
+                 diff_cfg["timestep_sampling"], diff_cfg.get("logit_mean", 0.0), diff_cfg.get("logit_std", 1.0))
+
     model.train()
     for epoch in range(start_epoch, tcfg["epochs"]):
         epoch_loss = 0.0
+        epoch_improve = 0.0
+        epoch_loss_lo = 0.0
+        epoch_loss_hi = 0.0
         epoch_steps = 0
+        lo_count = 0
+        hi_count = 0
         t0 = time.time()
 
         pbar = tqdm(
@@ -410,6 +465,9 @@ def train(cfg: dict, args):
             _, _, H_hr, W_hr = hr.shape
             lr_up = F.interpolate(lr, size=(H_hr, W_hr), mode="bicubic", align_corners=False)
 
+            # Residual learning: pass bicubic baseline so diffusion learns the residual
+            x_bicubic = lr_up if residual_learning else None
+
             with autocast(enabled=use_amp):
                 if consistency_trainer is not None:
                     # Consistency training step
@@ -419,7 +477,7 @@ def train(cfg: dict, args):
                         )
                 else:
                     # Standard rectified flow training
-                    result = flow.training_step(model, hr, lr_up)
+                    result = flow.training_step(model, hr, lr_up, x_bicubic=x_bicubic)
 
                 loss = result["loss"] / accum_steps
 
@@ -438,12 +496,25 @@ def train(cfg: dict, args):
                 global_step += 1
 
             epoch_loss += result["loss"].item()
+            if "noise_improve" in result:
+                epoch_improve += result["noise_improve"]
+                if not math.isnan(result["loss_lo_t"]):
+                    epoch_loss_lo += result["loss_lo_t"]
+                    lo_count += 1
+                if not math.isnan(result["loss_hi_t"]):
+                    epoch_loss_hi += result["loss_hi_t"]
+                    hi_count += 1
             epoch_steps += 1
 
             # Update progress bar
             avg_loss = epoch_loss / epoch_steps
             lr_current = optimizer.param_groups[0]["lr"]
-            pbar.set_postfix(loss=f"{result['loss'].item():.4f}", avg=f"{avg_loss:.4f}", lr=f"{lr_current:.2e}")
+            postfix = dict(loss=f"{result['loss'].item():.4f}", avg=f"{avg_loss:.4f}", lr=f"{lr_current:.2e}")
+            if "noise_improve" in result:
+                postfix["imp"] = f"{result['noise_improve']:.1%}"
+                postfix["lo"] = f"{result['loss_lo_t']:.3f}"
+                postfix["hi"] = f"{result['loss_hi_t']:.3f}"
+            pbar.set_postfix(**postfix)
 
             # Logging
             if global_step % log_interval == 0 and global_step > 0:
@@ -457,6 +528,10 @@ def train(cfg: dict, args):
                     "train/epoch": epoch,
                     "train/step": global_step,
                 }
+                if "noise_improve" in result:
+                    log_dict["train/noise_improve"] = result["noise_improve"]
+                    log_dict["train/loss_lo_t"] = result["loss_lo_t"]
+                    log_dict["train/loss_hi_t"] = result["loss_hi_t"]
                 if "v_pred_norm" in result:
                     log_dict["train/v_pred_norm"] = result["v_pred_norm"]
                 if "consistency_gap" in result:
@@ -469,7 +544,14 @@ def train(cfg: dict, args):
         t_train_end = time.time()
         epoch_time = t_train_end - t0
         avg_loss = epoch_loss / max(epoch_steps, 1)
-        log.info("Epoch %d/%d done in %.1fs | Avg Loss: %.4f", epoch+1, tcfg['epochs'], epoch_time, avg_loss)
+        avg_improve = epoch_improve / max(epoch_steps, 1)
+        avg_lo = epoch_loss_lo / max(lo_count, 1)
+        avg_hi = epoch_loss_hi / max(hi_count, 1)
+        if epoch_improve != 0:
+            log.info("Epoch %d/%d done in %.1fs | Loss: %.4f | Improve: %.1f%% | Lo/Hi: %.3f/%.3f",
+                     epoch+1, tcfg['epochs'], epoch_time, avg_loss, avg_improve*100, avg_lo, avg_hi)
+        else:
+            log.info("Epoch %d/%d done in %.1fs | Avg Loss: %.4f", epoch+1, tcfg['epochs'], epoch_time, avg_loss)
 
         # ---- Validation (starts at val_start_epoch, then every val_interval) ----
         if (epoch + 1) >= val_start_epoch and (epoch + 1 - val_start_epoch) % val_interval == 0:

@@ -1,0 +1,58 @@
+model:
+  in_channels: 3
+  out_channels: 3
+  hidden_dims: [64, 128, 256, 512]
+  depths: [2, 2, 4, 4]
+  dct_block_size: 8
+  transform_type: "dct"
+  num_heads: 8
+  mode_weighting: true
+  dropout: 0.1
+  scale_factor: 4
+  residual_learning: false
+  spectral_conv_size: 1
+  spatial_dual_path: false
+  freq_norm: false
+  progressive_stem: false
+  concat_cond: false
+  input_proj: false
+
+diffusion:
+  type: "rectified_flow"
+  num_train_timesteps: 1000
+  num_inference_steps: 10
+  prediction_type: "epsilon"
+  ode_solver: "euler"
+
+training:
+  epochs: 20
+  batch_size: 16
+  accumulation_steps: 2
+  learning_rate: 2.0e-4
+  weight_decay: 0.01
+  optimizer: "adamw"
+  ema_decay: 0.9999
+  gradient_clip: 1.0
+  mixed_precision: false
+  scheduler:
+    type: "cosine"
+    warmup_steps: 50
+    min_lr: 1.0e-6
+
+data:
+  train_dataset: "div2k"
+  val_dataset: "div2k"
+  data_dir: "./data"
+  patch_size: 192
+  augment: true
+  num_workers: 4
+  pin_memory: false
+  subset: 0.125
+
+logging:
+  log_interval: 100
+  val_start_epoch: 999
+  val_interval: 999
+
+checkpoint:
+  dir: "./checkpoints"
