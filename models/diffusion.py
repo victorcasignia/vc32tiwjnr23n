@@ -285,7 +285,10 @@ class RectifiedFlow:
 
         # --- Single-step direct prediction (bypass ODE for x0-prediction) ---
         if self.prediction_type == "x0" and self.single_step_inference:
-            t = torch.full((shape[0],), t_start, device=device)
+            # Deterministic: feed zeros (no random noise) at a small t
+            # so the model sees "almost clean" input and predicts the residual.
+            x = torch.zeros(shape, device=device)
+            t = torch.full((shape[0],), 0.05, device=device)
             x = model(x, t, x_lr)  # model directly predicts x_0
             if x_bicubic is not None:
                 x = x + x_bicubic

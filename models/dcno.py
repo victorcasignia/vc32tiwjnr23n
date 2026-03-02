@@ -584,16 +584,19 @@ class DCNO(nn.Module):
             )
 
         # Pixel-space refinement tail: blends across DCT block boundaries
-        # to eliminate grid artifacts. Lightweight (3 conv layers, ~50K params).
+        # to eliminate grid artifacts. 8 conv layers, 64 channels (~225K params).
+        # Receptive field = 19px (covers 2+ block boundaries for 8×8 blocks).
         # Applied after IDCT in pixel domain with a residual connection.
         if pixel_refinement:
-            self.pixel_refine = nn.Sequential(
-                nn.Conv2d(out_channels, 32, 3, padding=1),
-                nn.SiLU(),
-                nn.Conv2d(32, 32, 3, padding=1),
-                nn.SiLU(),
-                nn.Conv2d(32, out_channels, 3, padding=1),
-            )
+            refine_ch = 64
+            layers = []
+            layers.append(nn.Conv2d(out_channels, refine_ch, 3, padding=1))
+            layers.append(nn.SiLU())
+            for _ in range(6):  # 6 interior layers
+                layers.append(nn.Conv2d(refine_ch, refine_ch, 3, padding=1))
+                layers.append(nn.SiLU())
+            layers.append(nn.Conv2d(refine_ch, out_channels, 3, padding=1))
+            self.pixel_refine = nn.Sequential(*layers)
             # Init last conv to zero so refinement starts as identity
             nn.init.zeros_(self.pixel_refine[-1].weight)
             nn.init.zeros_(self.pixel_refine[-1].bias)
