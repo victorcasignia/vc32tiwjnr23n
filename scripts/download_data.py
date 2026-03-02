@@ -68,18 +68,35 @@ def download_file(url: str, dest: str, max_retries: int = 5) -> str:
         try:
             log.info("Downloading %s (attempt %d/%d)", url, attempt, max_retries)
             req = Request(url, headers=headers)
-            resp = urlopen(req, timeout=60)
-            total = int(resp.headers.get("Content-Length", 0))
-            with (
-                open(dest, "wb") as f,
-                tqdm(total=total, unit="B", unit_scale=True, desc=f"  {fname}", leave=True) as pbar,
-            ):
-                while True:
-                    chunk = resp.read(1 << 16)  # 64 KB
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    pbar.update(len(chunk))
+            with urlopen(req, timeout=60) as resp:
+                total_header = resp.headers.get("Content-Length")
+                total = int(total_header) if total_header and total_header.isdigit() else None
+
+                with (
+                    open(dest, "wb") as f,
+                    tqdm(
+                        total=total,
+                        unit="B",
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        desc=f"  {fname}",
+                        dynamic_ncols=True,
+                        miniters=1,
+                        smoothing=0.1,
+                        leave=True,
+                        file=sys.stdout,
+                        bar_format=(
+                            "{l_bar}{bar}| {n_fmt}/{total_fmt} "
+                            "[{elapsed}<{remaining}, {rate_fmt}]"
+                        ) if total else None,
+                    ) as pbar,
+                ):
+                    while True:
+                        chunk = resp.read(1 << 16)  # 64 KB
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        pbar.update(len(chunk))
             return dest
         except Exception as e:
             log.warning("Attempt %d failed: %s", attempt, e)
