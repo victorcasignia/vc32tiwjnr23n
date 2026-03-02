@@ -51,15 +51,20 @@ class RectifiedFlow:
         timestep_sampling: str = "uniform",  # "uniform" or "logit_normal"
         logit_mean: float = 0.0,
         logit_std: float = 1.0,
+        # --- Single-step inference (bypass ODE for x0 prediction) ---
+        single_step_inference: bool = False,
     ):
         self.num_train_timesteps = num_train_timesteps
         self.num_inference_steps = num_inference_steps
-        self.prediction_type = prediction_type  # "velocity" or "epsilon"
+        self.prediction_type = prediction_type  # "velocity", "epsilon", or "x0"
         self.ode_solver = ode_solver
 
         # LR-init: start sampling from noised LR instead of pure noise
         self.lr_init = lr_init
         self.t_max = t_max
+
+        # Single-step: for x0 prediction, one forward pass at t_max instead of ODE
+        self.single_step_inference = single_step_inference
 
         # Logit-normal timestep sampling (SD3 style)
         self.timestep_sampling = timestep_sampling
@@ -277,6 +282,14 @@ class RectifiedFlow:
             # Standard: start from pure noise at t=1
             x = torch.randn(shape, device=device)
             t_start = 1.0
+
+        # --- Single-step direct prediction (bypass ODE for x0-prediction) ---
+        if self.prediction_type == "x0" and self.single_step_inference:
+            t = torch.full((shape[0],), t_start, device=device)
+            x = model(x, t, x_lr)  # model directly predicts x_0
+            if x_bicubic is not None:
+                x = x + x_bicubic
+            return x.clamp(0, 1)
 
         # Time steps from t_start → 0
         dt = t_start / num_steps

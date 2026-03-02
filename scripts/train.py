@@ -96,6 +96,7 @@ def build_model(cfg: dict) -> DCNO:
         progressive_stem=mcfg.get("progressive_stem", False),
         concat_cond=mcfg.get("concat_cond", False),
         input_proj=mcfg.get("input_proj", False),
+        pixel_refinement=mcfg.get("pixel_refinement", False),
     )
 
 
@@ -346,6 +347,7 @@ def train(cfg: dict, args):
         timestep_sampling=diff_cfg.get("timestep_sampling", "uniform"),
         logit_mean=diff_cfg.get("logit_mean", 0.0),
         logit_std=diff_cfg.get("logit_std", 1.0),
+        single_step_inference=diff_cfg.get("single_step_inference", False),
     )
 
     consistency_trainer = None

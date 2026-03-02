@@ -440,6 +440,7 @@ class DCNO(nn.Module):
         progressive_stem: bool = False,
         concat_cond: bool = False,
         input_proj: bool = False,
+        pixel_refinement: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -450,6 +451,7 @@ class DCNO(nn.Module):
         self.residual_learning = residual_learning
         self.concat_cond = concat_cond
         self.use_input_proj = input_proj
+        self.use_pixel_refinement = pixel_refinement
 
         n = dct_block_size
         num_down = len(hidden_dims) - 1  # number of spatial downsamples
@@ -581,6 +583,23 @@ class DCNO(nn.Module):
                 nn.Conv2d(hidden_dims[0], spec_channels, 3, padding=1),
             )
 
+        # Pixel-space refinement tail: blends across DCT block boundaries
+        # to eliminate grid artifacts. Lightweight (3 conv layers, ~50K params).
+        # Applied after IDCT in pixel domain with a residual connection.
+        if pixel_refinement:
+            self.pixel_refine = nn.Sequential(
+                nn.Conv2d(out_channels, 32, 3, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(32, 32, 3, padding=1),
+                nn.SiLU(),
+                nn.Conv2d(32, out_channels, 3, padding=1),
+            )
+            # Init last conv to zero so refinement starts as identity
+            nn.init.zeros_(self.pixel_refine[-1].weight)
+            nn.init.zeros_(self.pixel_refine[-1].bias)
+        else:
+            self.pixel_refine = None
+
         self._init_weights()
 
     def _init_weights(self):
@@ -699,6 +718,10 @@ class DCNO(nn.Module):
 
         # --- Inverse transform back to pixel domain ---
         out = self.inv_transform(h)    # (B, C, H, W)
+
+        # --- Pixel-space refinement (deblocking / cross-boundary blending) ---
+        if self.pixel_refine is not None:
+            out = out + self.pixel_refine(out)
 
         # --- Remove padding ---
         out = self._unpad(out, pad_h, pad_w)

@@ -17,30 +17,33 @@ model:
   progressive_stem: true
   concat_cond: true                 # concatenate LR with x_t at input (standard SR3 approach)
   input_proj: true                  # pixel-space x_t projection (bypasses DCT for denoising)
+  pixel_refinement: true            # pixel-space deblocking CNN after IDCT (fixes grid artifacts)
 
 diffusion:
   type: "rectified_flow"
   num_train_timesteps: 1000
-  num_inference_steps: 10
+  num_inference_steps: 20
   prediction_type: "x0"                # x0: model predicts clean image directly
   ode_solver: "euler"
   # --- LR-initialized sampling (start from noised LR, not pure noise) ---
   lr_init: true
-  t_max: 0.8
+  t_max: 0.4
   # --- Frequency-weighted loss (emphasize low-freq DCT errors) ---
   freq_weighted_loss: true
   freq_loss_alpha: 2.0
-  # --- Logit-normal timestep sampling (concentrate on mid-t, SD3 style) ---
+  # --- Logit-normal timestep sampling (concentrate on low-t, matching inference range) ---
   timestep_sampling: "logit_normal"
-  logit_mean: 0.0
+  logit_mean: -0.5
   logit_std: 1.0
+  # --- Single-step inference (use model's x0 prediction directly, no ODE) ---
+  single_step_inference: true
 
 training:
   epochs: 100
   batch_size: 16
   val_batch_size: 8
   accumulation_steps: 2
-  learning_rate: 1.0e-2
+  learning_rate: 3.0e-3
   weight_decay: 0.01
   optimizer: "musgd"
   ema_decay: 0.9999
