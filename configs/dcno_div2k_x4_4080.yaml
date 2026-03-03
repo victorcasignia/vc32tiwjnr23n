@@ -1,0 +1,81 @@
+model:
+  name: "dcno"
+  in_channels: 3
+  out_channels: 3
+  hidden_dims: [64, 128, 256, 512]
+  depths: [2, 2, 4, 4]
+  dct_block_size: 8
+  transform_type: "dct"
+  num_heads: 8
+  mode_weighting: true
+  dropout: 0.1
+  scale_factor: 4
+  residual_learning: true
+  spectral_conv_size: 3
+  spatial_dual_path: false
+  freq_norm: true
+  progressive_stem: true
+  concat_cond: true                 # concatenate LR with x_t at input (standard SR3 approach)
+  input_proj: true                  # pixel-space x_t projection (bypasses DCT for denoising)
+  pixel_refinement: true            # pixel-space deblocking CNN after IDCT (fixes grid artifacts)
+
+diffusion:
+  type: "rectified_flow"
+  num_train_timesteps: 1000
+  num_inference_steps: 20
+  prediction_type: "x0"                # x0: model predicts clean image directly
+  ode_solver: "euler"
+  # --- LR-initialized sampling (start from noised LR, not pure noise) ---
+  lr_init: true
+  t_max: 0.4
+  # --- Frequency-weighted loss (emphasize low-freq DCT errors) ---
+  freq_weighted_loss: true
+  freq_loss_alpha: 2.0
+  # --- Logit-normal timestep sampling (concentrate on low-t, matching inference range) ---
+  timestep_sampling: "logit_normal"
+  logit_mean: -1.5
+  logit_std: 0.5
+  # --- Single-step inference (use model's x0 prediction directly, no ODE) ---
+  single_step_inference: true
+
+training:
+  epochs: 200
+  batch_size: 16
+  val_batch_size: 16
+  accumulation_steps: 2
+  learning_rate: 4.0e-3
+  weight_decay: 0.01
+  optimizer: "musgd"
+  ema_decay: 0.9999
+  gradient_clip: 1.0
+  mixed_precision: false
+  scheduler:
+    type: "cosine"
+    warmup_steps: 50
+    min_lr: 1.0e-6
+
+data:
+  train_dataset: "div2k"
+  val_dataset: "div2k"
+  test_datasets: ["set5", "set14", "bsd100", "urban100"]
+  data_dir: "./data"
+  patch_size: 192                   # smaller patches for x4 (48 LR → 192 HR)
+  augment: true
+  num_workers: 8
+  pin_memory: true
+  # subset: 0.1                    # uncomment to use 10% of data for quick convergence test
+
+logging:
+  project: "dcno-super-resolution"
+  run_name: "dcno-div2k-x4"
+  log_interval: 100
+  val_start_epoch: 5                # validate from epoch 1
+  val_interval: 5                   # validate every epoch
+  save_interval: 10
+  sample_interval: 5
+
+checkpoint:
+  dir: "./checkpoints"
+  save_best: true
+  save_last: true
+  max_keep: 5
