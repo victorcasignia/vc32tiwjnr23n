@@ -501,12 +501,7 @@ def train(cfg: dict, args):
         )
         for batch_idx, batch in enumerate(pbar):
             if keep_train_loader_resident:
-                try:
-                    hr, lr = next(train_iter)
-                except StopIteration:
-                    # Recreate iterator only when epoch traversal is exhausted.
-                    train_iter = iter(train_loader)
-                    hr, lr = next(train_iter)
+                hr, lr = next(train_iter)
             else:
                 hr, lr = batch
 
@@ -592,6 +587,11 @@ def train(cfg: dict, args):
                     wandb.log(log_dict, step=global_step)
 
         pbar.close()
+        # Pre-create the next epoch's iterator immediately so prefetching
+        # starts now (overlaps with validation / checkpointing / logging)
+        # instead of blocking at the top of the next epoch.
+        if keep_train_loader_resident:
+            train_iter = iter(train_loader)
         t_train_end = time.time()
         epoch_time = t_train_end - t0
         avg_loss = epoch_loss / max(epoch_steps, 1)
