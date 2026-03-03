@@ -345,6 +345,14 @@ def train(cfg: dict, args):
         drop_last=True,
         persistent_workers=_nw > 0,
     )
+
+    # CUDA path: keep a resident iterator so loader workers/pinned-memory
+    # buffers stay warm across epochs instead of being repeatedly recreated.
+    keep_train_loader_resident = device.type == "cuda"
+    train_iter = iter(train_loader) if keep_train_loader_resident else None
+    if keep_train_loader_resident:
+        log.info("CUDA loader residency: ON (train DataLoader iterator kept alive)")
+
     val_batch_size = tcfg.get("val_batch_size", 1)
     val_loader = DataLoader(
         val_ds,
@@ -484,13 +492,24 @@ def train(cfg: dict, args):
         hi_count = 0
         t0 = time.time()
 
+        pbar_src = range(len(train_loader)) if keep_train_loader_resident else train_loader
         pbar = tqdm(
-            train_loader,
+            pbar_src,
             desc=f"Epoch {epoch+1}/{tcfg['epochs']}",
             leave=True,
             dynamic_ncols=True,
         )
-        for batch_idx, (hr, lr) in enumerate(pbar):
+        for batch_idx, batch in enumerate(pbar):
+            if keep_train_loader_resident:
+                try:
+                    hr, lr = next(train_iter)
+                except StopIteration:
+                    # Recreate iterator only when epoch traversal is exhausted.
+                    train_iter = iter(train_loader)
+                    hr, lr = next(train_iter)
+            else:
+                hr, lr = batch
+
             hr, lr = hr.to(device), lr.to(device)
 
             # Upsample LR to HR spatial size for conditioning
