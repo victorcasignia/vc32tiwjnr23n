@@ -97,6 +97,10 @@ def build_model(cfg: dict) -> DCNO:
         concat_cond=mcfg.get("concat_cond", False),
         input_proj=mcfg.get("input_proj", False),
         pixel_refinement=mcfg.get("pixel_refinement", False),
+        use_block_attention=mcfg.get("use_block_attention", False),
+        attention_window_size=mcfg.get("attention_window_size", 4),
+        attention_heads=mcfg.get("attention_heads", 4),
+        attn_start_stage=mcfg.get("attn_start_stage", 2),
     )
 
 

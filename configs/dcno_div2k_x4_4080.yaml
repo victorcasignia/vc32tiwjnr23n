@@ -18,6 +18,11 @@ model:
   concat_cond: true                 # concatenate LR with x_t at input (standard SR3 approach)
   input_proj: true                  # pixel-space x_t projection (bypasses DCT for denoising)
   pixel_refinement: true            # pixel-space deblocking CNN after IDCT (fixes grid artifacts)
+  # --- DCT block attention (neighbor-aware local window attention) ---
+  use_block_attention: true         # enable local window attention over DCT block positions
+  attention_window_size: 4          # attention window in block-space (4x4 = 16 neighbouring blocks)
+  attention_heads: 4                # heads for window attention (head_dim = hidden_dim / heads)
+  attn_start_stage: 2               # first encoder stage (0-indexed) that gets attention
 
 diffusion:
   type: "rectified_flow"

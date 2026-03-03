@@ -248,14 +248,184 @@ class SpatialBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# DCT Window Attention — neighbor-aware local attention over DCT blocks
+# ---------------------------------------------------------------------------
+
+class DCTWindowAttention(nn.Module):
+    """
+    Local window self-attention over DCT block positions.
+
+    In spectral feature space each spatial grid cell corresponds to one
+    DCT block.  Full O(N²) self-attention across all blocks is expensive;
+    instead we restrict attention to a local window_size × window_size
+    neighbourhood of blocks, giving O(N · w²) complexity.
+
+    This lets every block reason about how its DCT coefficients relate to
+    those of its spatial neighbours — exactly the cross-block frequency
+    coherence that matters for sharp edge reconstruction in super-resolution.
+
+    A learnable relative position bias table (following Swin Transformer)
+    is added to the attention logits so the model is aware of how far two
+    blocks are from each other within the window.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 4,
+        window_size: int = 4,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        assert dim % num_heads == 0, (
+            f"dim {dim} must be divisible by num_heads {num_heads}"
+        )
+        self.dim = dim
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        # Fused QKV projection (linear on flattened tokens)
+        self.qkv = nn.Linear(dim, dim * 3, bias=True)
+        self.proj = nn.Linear(dim, dim)
+        self.attn_drop = nn.Dropout(dropout)
+        self.proj_drop = nn.Dropout(dropout)
+
+        # Relative position bias — table size (2w-1)² × heads
+        self.rel_pos_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size - 1) ** 2, num_heads)
+        )
+        nn.init.trunc_normal_(self.rel_pos_bias_table, std=0.02)
+
+        # Pre-compute relative position index for a window_size × window_size window
+        self._build_rel_pos_index(window_size)
+
+    def _build_rel_pos_index(self, ws: int) -> None:
+        coords = torch.stack(
+            torch.meshgrid(
+                torch.arange(ws), torch.arange(ws), indexing="ij"
+            )
+        )  # (2, ws, ws)
+        coords_flat = coords.flatten(1)  # (2, ws²)
+        # Relative distance for all pairs of positions
+        rel = coords_flat[:, :, None] - coords_flat[:, None, :]  # (2, ws², ws²)
+        rel = rel.permute(1, 2, 0).contiguous()  # (ws², ws², 2)
+        rel[:, :, 0] += ws - 1   # shift to non-negative
+        rel[:, :, 1] += ws - 1
+        rel[:, :, 0] *= 2 * ws - 1  # rasterise to 1-D index
+        rel_pos_index = rel.sum(-1)  # (ws², ws²)
+        self.register_buffer("rel_pos_index", rel_pos_index)
+
+    # ------------------------------------------------------------------
+    # Window partition / merge helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _partition(x: torch.Tensor, ws: int) -> Tuple[torch.Tensor, int, int, int, int]:
+        """Split (B, C, H, W) into non-overlapping ws×ws windows.
+
+        Returns:
+            windows: (B*nH*nW, ws², C)
+            pad_h, pad_w, H_padded, W_padded
+        """
+        B, C, H, W = x.shape
+        pad_h = (ws - H % ws) % ws
+        pad_w = (ws - W % ws) % ws
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+        Hp, Wp = H + pad_h, W + pad_w
+        x = x.permute(0, 2, 3, 1)  # (B, Hp, Wp, C)
+        x = x.reshape(B, Hp // ws, ws, Wp // ws, ws, C)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()  # (B, nH, nW, ws, ws, C)
+        nH, nW = Hp // ws, Wp // ws
+        windows = x.reshape(B * nH * nW, ws * ws, C)
+        return windows, pad_h, pad_w, Hp, Wp
+
+    @staticmethod
+    def _merge(windows: torch.Tensor, ws: int,
+               B: int, Hp: int, Wp: int,
+               pad_h: int, pad_w: int, H: int, W: int) -> torch.Tensor:
+        """Merge window tokens back to (B, C, H, W)."""
+        nH, nW = Hp // ws, Wp // ws
+        C = windows.shape[-1]
+        x = windows.reshape(B, nH, nW, ws, ws, C)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous().reshape(B, Hp, Wp, C)
+        x = x.permute(0, 3, 1, 2)  # (B, C, Hp, Wp)
+        if pad_h or pad_w:
+            x = x[:, :, :H, :W]
+        return x
+
+    # ------------------------------------------------------------------
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, C, H, W) — DCT feature map where H, W are in block space
+        Returns:
+            (B, C, H, W) — same shape, each block updated by its neighbours'
+            frequency context.
+        """
+        B, C, H, W = x.shape
+        ws = self.window_size
+
+        # Partition into local windows
+        wins, pad_h, pad_w, Hp, Wp = self._partition(x, ws)
+        # wins: (B*nH*nW, ws², C)
+        N_win, N_tok, _ = wins.shape
+
+        # QKV
+        qkv = self.qkv(wins)  # (N_win, N_tok, 3*C)
+        qkv = qkv.reshape(N_win, N_tok, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, N_win, heads, N_tok, head_dim)
+        q, k, v = qkv.unbind(0)
+
+        # Scaled dot-product attention (local: N_tok = ws² ≤ 16 for ws=4)
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # (N_win, heads, N_tok, N_tok)
+
+        # Add relative position bias
+        bias = self.rel_pos_bias_table[
+            self.rel_pos_index.view(-1)
+        ]  # (N_tok², heads)
+        bias = bias.view(
+            N_tok, N_tok, self.num_heads
+        ).permute(2, 0, 1).contiguous()  # (heads, N_tok, N_tok)
+        attn = attn + bias.unsqueeze(0)  # broadcast over N_win
+
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        out = (attn @ v).transpose(1, 2).reshape(N_win, N_tok, C)
+        out = self.proj(out)
+        out = self.proj_drop(out)
+
+        # Merge windows back to spatial map
+        out = self._merge(out, ws, B, Hp, Wp, pad_h, pad_w, H, W)
+        return out
+
+
+# ---------------------------------------------------------------------------
 # DCNO Block — single operator layer
 # ---------------------------------------------------------------------------
 
 class DCNOBlock(nn.Module):
     """
     One DCT Neural Operator block:
-      AdaGN → DCTSpectralConv → SiLU → AdaGN → ChannelMLP → residual
-      (optional) → SpatialBlock for cross-block coherence
+
+      AdaGN → DCTSpectralConv → SiLU → residual
+      (optional) AdaGN → DCTWindowAttention → residual   ← neighbor-aware
+      AdaGN → ChannelMLP → residual
+      (optional) SpatialBlock for cross-block coherence
+
+    When ``use_attention=True`` a local window self-attention (default
+    window 4×4 = 16 neighbouring DCT blocks) is inserted between the
+    spectral convolution and the channel MLP.  This lets each block
+    aggregate context from its spatial neighbours in frequency space,
+    which is critical for reconstructing consistent edges and textures
+    across block boundaries in super-resolution.
+
+    Complexity per block: O(N · w²) where N = number of DCT blocks and
+    w = window_size, so it scales gracefully even at fine resolutions.
     """
 
     def __init__(
@@ -267,6 +437,9 @@ class DCNOBlock(nn.Module):
         dropout: float = 0.0,
         spectral_conv_size: int = 1,
         spatial_dual_path: bool = False,
+        use_attention: bool = False,
+        attention_window_size: int = 4,
+        attention_heads: int = 4,
     ):
         super().__init__()
         # Time projection
@@ -278,6 +451,23 @@ class DCNOBlock(nn.Module):
             dim, dim, mode_weighting, kernel_size=spectral_conv_size,
         )
         self.act = nn.SiLU()
+
+        # Local window attention (neighbor-aware, bounded complexity)
+        if use_attention:
+            # Clamp heads so dim remains divisible
+            heads = attention_heads
+            while dim % heads != 0 and heads > 1:
+                heads -= 1
+            self.attn_norm = AdaptiveGroupNorm(dim)
+            self.attn = DCTWindowAttention(
+                dim=dim,
+                num_heads=heads,
+                window_size=attention_window_size,
+                dropout=dropout,
+            )
+        else:
+            self.attn_norm = None
+            self.attn = None
 
         # Channel MLP path
         self.norm2 = AdaptiveGroupNorm(dim)
@@ -291,18 +481,24 @@ class DCNOBlock(nn.Module):
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         scale, shift = self.time_mlp(t_emb)
 
-        # Spectral convolution
+        # 1. Spectral convolution
         h = self.norm1(x, scale, shift)
         h = self.spectral_conv(h)
         h = self.act(h)
         x = x + h
 
-        # Channel MLP 
+        # 2. Local window attention over DCT block neighbours (optional)
+        if self.attn is not None:
+            h = self.attn_norm(x, scale, shift)
+            h = self.attn(h)
+            x = x + h
+
+        # 3. Channel MLP
         h = self.norm2(x, scale, shift)
         h = self.channel_mlp(h)
         x = x + h
 
-        # Spatial cross-block path (if enabled)
+        # 4. Spatial cross-block path (if enabled)
         if self.spatial_block is not None:
             x = self.spatial_block(x)
 
@@ -441,6 +637,10 @@ class DCNO(nn.Module):
         concat_cond: bool = False,
         input_proj: bool = False,
         pixel_refinement: bool = False,
+        use_block_attention: bool = False,
+        attention_window_size: int = 4,
+        attention_heads: int = 4,
+        attn_start_stage: int = 2,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -515,6 +715,10 @@ class DCNO(nn.Module):
         self.encoder_blocks = nn.ModuleList()
         self.downsamples = nn.ModuleList()
         
+        # Helper: should stage i use attention?
+        def _use_attn(stage_idx: int) -> bool:
+            return use_block_attention and stage_idx >= attn_start_stage
+
         for i, (dim, depth) in enumerate(zip(hidden_dims, depths)):
             stage_blocks = nn.ModuleList()
             for _ in range(depth):
@@ -523,6 +727,9 @@ class DCNO(nn.Module):
                         dim, time_dim, num_heads, mode_weighting, dropout,
                         spectral_conv_size=spectral_conv_size,
                         spatial_dual_path=spatial_dual_path,
+                        use_attention=_use_attn(i),
+                        attention_window_size=attention_window_size,
+                        attention_heads=attention_heads,
                     )
                 )
             self.encoder_blocks.append(stage_blocks)
@@ -530,17 +737,23 @@ class DCNO(nn.Module):
             if i < len(hidden_dims) - 1:
                 self.downsamples.append(Downsample(dim, hidden_dims[i + 1]))
 
-        # ---- Bottleneck ----
+        # ---- Bottleneck (always uses attention when use_block_attention=True) ----
         self.bottleneck = nn.ModuleList([
             DCNOBlock(
                 hidden_dims[-1], time_dim, num_heads, mode_weighting, dropout,
                 spectral_conv_size=spectral_conv_size,
                 spatial_dual_path=spatial_dual_path,
+                use_attention=use_block_attention,
+                attention_window_size=attention_window_size,
+                attention_heads=attention_heads,
             ),
             DCNOBlock(
                 hidden_dims[-1], time_dim, num_heads, mode_weighting, dropout,
                 spectral_conv_size=spectral_conv_size,
                 spatial_dual_path=spatial_dual_path,
+                use_attention=use_block_attention,
+                attention_window_size=attention_window_size,
+                attention_heads=attention_heads,
             ),
         ])
 
@@ -551,13 +764,12 @@ class DCNO(nn.Module):
 
         rev_dims = list(reversed(hidden_dims))
         rev_depths = list(reversed(depths))
+        num_stages = len(hidden_dims)
 
         for i, (dim, depth) in enumerate(zip(rev_dims, rev_depths)):
-            # Skip connection projection (encoder_dim + decoder_dim → decoder_dim)
-            if i > 0:
-                self.skip_convs.append(nn.Conv2d(dim * 2, dim, 1))
-            else:
-                self.skip_convs.append(nn.Conv2d(dim * 2, dim, 1))
+            # decoder stage i mirrors encoder stage (num_stages-1-i)
+            enc_stage_idx = num_stages - 1 - i
+            self.skip_convs.append(nn.Conv2d(dim * 2, dim, 1))
 
             stage_blocks = nn.ModuleList()
             for _ in range(depth):
@@ -566,6 +778,9 @@ class DCNO(nn.Module):
                         dim, time_dim, num_heads, mode_weighting, dropout,
                         spectral_conv_size=spectral_conv_size,
                         spatial_dual_path=spatial_dual_path,
+                        use_attention=_use_attn(enc_stage_idx),
+                        attention_window_size=attention_window_size,
+                        attention_heads=attention_heads,
                     )
                 )
             self.decoder_blocks.append(stage_blocks)
@@ -603,6 +818,12 @@ class DCNO(nn.Module):
         else:
             self.pixel_refine = None
 
+        self._attn_cfg = dict(
+            use_block_attention=use_block_attention,
+            attention_window_size=attention_window_size,
+            attention_heads=attention_heads,
+            attn_start_stage=attn_start_stage,
+        )
         self._init_weights()
 
     def _init_weights(self):
