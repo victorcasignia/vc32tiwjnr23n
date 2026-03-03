@@ -2,14 +2,14 @@ model:
   name: "dcno"
   in_channels: 3
   out_channels: 3
-  hidden_dims: [64, 128, 256, 512]
-  depths: [2, 2, 4, 4]
+  hidden_dims: [32, 64, 128, 256]
+  depths: [2, 2, 4, 2]
   dct_block_size: 8
   transform_type: "dct"
   num_heads: 8
   mode_weighting: true
   dropout: 0.1
-  scale_factor: 4
+  scale_factor: 2
   residual_learning: true
   spectral_conv_size: 3
   spatial_dual_path: false
@@ -18,6 +18,11 @@ model:
   concat_cond: true                 # concatenate LR with x_t at input (standard SR3 approach)
   input_proj: true                  # pixel-space x_t projection (bypasses DCT for denoising)
   pixel_refinement: true            # pixel-space deblocking CNN after IDCT (fixes grid artifacts)
+  # --- DCT block attention (neighbor-aware local window attention) ---
+  use_block_attention: true         # enable local window attention over DCT block positions
+  attention_window_size: 4          # attention window in block-space (4x4 = 16 neighbouring blocks)
+  attention_heads: 4                # heads for window attention (head_dim = hidden_dim / heads)
+  attn_start_stage: 2               # first encoder stage (0-indexed) that gets attention
 
 diffusion:
   type: "rectified_flow"
@@ -43,7 +48,7 @@ training:
   batch_size: 16
   val_batch_size: 8
   accumulation_steps: 2
-  learning_rate: 1.0e-3
+  learning_rate: 4.0e-3
   weight_decay: 0.01
   optimizer: "musgd"
   ema_decay: 0.9999
@@ -69,8 +74,8 @@ logging:
   project: "dcno-super-resolution"
   run_name: "dcno-div2k-x4"
   log_interval: 100
-  val_start_epoch: 50                # validate from epoch 1
-  val_interval: 1                   # validate every epoch
+  val_start_epoch: 5                # validate from epoch 1
+  val_interval: 5                   # validate every epoch
   save_interval: 10
   sample_interval: 5
 

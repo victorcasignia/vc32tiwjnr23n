@@ -19,6 +19,7 @@ Usage:
 import argparse
 import logging
 import os
+import shutil
 import sys
 import math
 import time
@@ -74,6 +75,30 @@ def get_device(preference: str = "auto") -> torch.device:
 def load_config(path: str) -> dict:
     with open(path, "r") as f:
         return yaml.safe_load(f)
+
+
+def save_config_to_wandb(config_path: str):
+    """Upload the exact training YAML config file to the active wandb run."""
+    if not HAS_WANDB or wandb.run is None:
+        return
+
+    if not config_path:
+        log.warning("No config path provided; skipping wandb config file upload.")
+        return
+
+    cfg_path = Path(config_path).expanduser().resolve()
+    if not cfg_path.exists():
+        log.warning("Config file not found at %s; skipping wandb upload.", cfg_path)
+        return
+
+    # Keep original filename and path metadata in wandb file panel
+    wandb.save(str(cfg_path), base_path=str(cfg_path.parent), policy="now")
+
+    # Also store a canonical copy as `config.yaml` in run files for quick access
+    run_cfg = Path(wandb.run.dir) / "config.yaml"
+    shutil.copy2(cfg_path, run_cfg)
+    wandb.save(str(run_cfg), policy="now")
+    log.info("Uploaded config to wandb: %s", cfg_path)
 
 
 def build_model(cfg: dict) -> DCNO:
@@ -416,6 +441,7 @@ def train(cfg: dict, args):
             config=cfg,
             resume="allow" if args.resume else None,
         )
+        save_config_to_wandb(args.config)
         wandb.watch(model, log="gradients", log_freq=lcfg.get("log_interval", 100))
 
     # ---- Training ----
