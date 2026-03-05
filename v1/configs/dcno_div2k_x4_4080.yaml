@@ -19,7 +19,7 @@ model:
   input_proj: true                  # pixel-space x_t projection (bypasses DCT for denoising)
   pixel_refinement: true            # pixel-space deblocking CNN after IDCT (fixes grid artifacts)
   # --- DCT block attention (neighbor-aware local window attention) ---
-  use_block_attention: true         # enable local window attention over DCT block positions
+  use_block_attention: false         # enable local window attention over DCT block positions
   attention_window_size: 4          # attention window in block-space (4x4 = 16 neighbouring blocks)
   attention_heads: 4                # heads for window attention (head_dim = hidden_dim / heads)
   attn_start_stage: 2               # first encoder stage (0-indexed) that gets attention
@@ -44,9 +44,9 @@ diffusion:
   single_step_inference: true
 
 training:
-  epochs: 200
+  epochs: 300
   batch_size: 16
-  val_batch_size: 16
+  val_batch_size: 16a
   accumulation_steps: 2
   learning_rate: 4.0e-3
   weight_decay: 0.01
@@ -66,7 +66,7 @@ data:
   data_dir: "./data"
   patch_size: 192                   # smaller patches for x4 (48 LR → 192 HR)
   augment: true
-  num_workers: 8
+  num_workers: 0
   pin_memory: true
   # subset: 0.1                    # uncomment to use 10% of data for quick convergence test
 

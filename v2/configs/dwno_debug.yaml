@@ -1,0 +1,51 @@
+# DWNO-SR  ·  Fast smoke-test / debug config  (tiny model, x4)
+# Use to verify end-to-end correctness before a full run.
+scale: 4
+
+train_hr_dir: "../data/DIV2K/DIV2K_train_HR"
+val_hr_dir:   "../data/DIV2K/DIV2K_valid_HR"
+
+patch_size:  64
+augment:     true
+cache:       false
+num_workers: 2
+
+# Tiny model
+channels:     32
+stage_depths: [2, 2]
+levels:       1
+kernel_size:  7
+mlp_ratio:    4.0
+drop_path:    0.0
+filter_len:   3
+
+lr:           2.0e-4
+weight_decay: 0.0
+grad_accum:   1
+clip_norm:    1.0
+
+lambda_ssim:      0.10
+lambda_wave:      0.05
+lambda_orth:      1.0e-4
+wave_loss_levels: 2
+
+epochs:       5
+total_steps:  500
+warmup_steps: 50
+batch_size:   4
+amp:          true
+
+ema:       false
+
+val_freq:  1
+log_freq:  10
+save_freq: 5
+val_crop_size: 64      # center-crop HR to this size before eval
+
+ckpt_dir:      "checkpoints/debug"
+run_name:      "dwno_debug"
+wandb:           false
+wandb_project:   "dwno-sr"
+wandb_num_images: 4
+
+device: "cuda"

@@ -1,0 +1,72 @@
+# DWNO-SR  ·  DIV2K  ·  ×4 super-resolution
+# -----------------------------------------------
+# Uses the dcno conda environment (see requirements.txt)
+# Run: python -m scripts.train --config configs/dwno_div2k_x4.yaml
+
+# ── Data ──────────────────────────────────────────────────────────────────
+scale: 4
+
+train_hr_dir: "../data/DIV2K/DIV2K_train_HR"
+train_lr_dir: "../data/DIV2K/DIV2K_train_LR_bicubic/X4"
+val_hr_dir:   "../data/DIV2K/DIV2K_valid_HR"
+val_lr_dir:   "../data/DIV2K/DIV2K_valid_LR_bicubic/X4"
+
+patch_size: 256    # HR patch size (LR patch = 64)
+augment:    true
+cache:      false
+num_workers: 4
+
+# ── Model ─────────────────────────────────────────────────────────────────
+in_channels:  3
+channels:     64             # internal feature channels (reduced from 96 for VRAM)
+stage_depths: [4, 4, 4]     # 3 stages × 4 blocks = 12 WNO blocks total
+levels:       2              # DWT levels per WNO block
+kernel_size:  7              # depthwise conv kernel (7×7 = 49-tap, 14×14 RF on subband)
+mlp_ratio:    4.0            # ConvNeXt-V2 inverted bottleneck expansion
+drop_path:    0.05           # stochastic depth rate
+filter_len:   3              # learnable lifting filter taps
+
+# ── Optimiser ─────────────────────────────────────────────────────────────
+optimizer:      musgd          # adam | adamw | musgd
+lr:             2.0e-4
+weight_decay:   1.0e-2
+grad_accum:     1
+clip_norm:      1.0
+# musgd-specific (only used when optimizer: musgd)
+momentum:       0.9
+muon_momentum:  0.95
+
+# ── Loss ──────────────────────────────────────────────────────────────────
+lambda_ssim:     0.10    # weight of (1 - SSIM) loss term
+lambda_wave:     0.05    # weight of wavelet-domain loss
+lambda_orth:     1.0e-4  # weight of lifting orthogonality regulariser
+wave_loss_levels: 3      # number of DWT levels used in wavelet loss
+
+# ── Schedule ──────────────────────────────────────────────────────────────
+# total_steps and warmup_steps are auto-computed in train.py:
+#   total_steps  = epochs × batches_per_epoch
+#   warmup_steps = max(50, total_steps // 20)   ← ~5% of training = ~25 epochs
+# Override warmup_steps here only if you want a custom value.
+epochs:        500
+batch_size:    64            # adjust to VRAM — 16 works on ~16 GB GPU
+amp:           true
+
+# ── EMA ───────────────────────────────────────────────────────────────────
+ema:           true
+ema_decay:     0.999
+
+# ── Logging ───────────────────────────────────────────────────────────────
+val_freq:   5          # validate every N epochs
+log_freq:   100        # log every N gradient steps
+save_freq:  10         # save checkpoint every N epochs
+val_crop_size: 256     # center-crop HR to this size before eval (handles variable-res val set)
+
+# ── Paths ─────────────────────────────────────────────────────────────────
+ckpt_dir:   "checkpoints/div2k_x4"
+run_name:   "dwno_div2k_x4"
+wandb:           true
+wandb_project:   "dwno-sr"
+wandb_num_images: 4        # sample images logged per validation
+
+# ── Device ────────────────────────────────────────────────────────────────
+device: "cuda"
