@@ -190,7 +190,8 @@ def validate(
         if crop_size is not None:
             lr, hr = _center_crop_pair(lr, hr, crop_size)
 
-        with autocast('cuda', enabled=amp):
+        amp_device = "cuda" if device.type == "cuda" else "cpu"
+        with autocast(amp_device, enabled=amp):
             sr = model(lr)
 
         sr_f = sr.clamp(0, 1).float()
@@ -276,7 +277,14 @@ def build_optimizer(model: nn.Module, cfg: dict) -> torch.optim.Optimizer:
 
 def train(cfg: dict):
     # ── Device ──────────────────────────────────────────────────────────
-    device = torch.device(cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu"))
+    default_device = (
+        "mps"
+        if torch.backends.mps.is_available()
+        else "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+    device = torch.device(cfg.get("device", default_device))
     print(f"[Train] Device: {device}")
 
     # ── Data ─────────────────────────────────────────────────────────────
@@ -326,7 +334,8 @@ def train(cfg: dict):
 
     # ── AMP Scaler ───────────────────────────────────────────────────────
     use_amp = cfg.get("amp", True) and device.type == "cuda"
-    scaler  = GradScaler('cuda', enabled=use_amp)
+    amp_device = "cuda" if device.type == "cuda" else "cpu"
+    scaler  = GradScaler(amp_device, enabled=use_amp)
 
     # ── Grad accum ───────────────────────────────────────────────────────
     accum_steps = cfg.get("grad_accum", 1)
@@ -392,7 +401,7 @@ def train(cfg: dict):
             hr = hr.to(device, non_blocking=True)
 
             # Forward  (model in AMP, loss in fp32 for numerical stability)
-            with autocast('cuda', enabled=use_amp):
+            with autocast(amp_device, enabled=use_amp):
                 sr = model(lr)
             loss, info = criterion(sr.float(), hr.float(), model)
             loss = loss / accum_steps
@@ -529,7 +538,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="Train DWNO-SR")
     p.add_argument("--config", required=True, help="Path to YAML config")
     p.add_argument("--resume", default=None, help="Path to checkpoint to resume from")
-    p.add_argument("--device", default=None, help="cuda / cpu")
+    p.add_argument("--device", default=None, help="mps / cuda / cpu")
     return p.parse_args()
 
 

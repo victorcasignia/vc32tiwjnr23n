@@ -1,0 +1,62 @@
+# DWNO-SR  ·  DIV2K  ·  ×2 super-resolution
+# -----------------------------------------------
+scale: 2
+
+# ── Data ──────────────────────────────────────────────────────────────────
+train_hr_dir: "../data/DIV2K/DIV2K_train_HR"
+train_lr_dir: "../data/DIV2K/DIV2K_train_LR_bicubic/X2"
+val_hr_dir:   "../data/DIV2K/DIV2K_valid_HR"
+val_lr_dir:   "../data/DIV2K/DIV2K_valid_LR_bicubic/X2"
+
+patch_size: 192
+augment:    true
+cache:      false
+num_workers: 4
+
+# ── Model ─────────────────────────────────────────────────────────────────
+in_channels:  3
+channels:     64
+stage_depths: [4, 4, 4]
+levels:       2
+kernel_size:  7
+mlp_ratio:    4.0
+drop_path:    0.05
+filter_len:   3
+
+# ── Optimiser ─────────────────────────────────────────────────────────────
+lr:           2.0e-4
+weight_decay: 1.0e-2
+grad_accum:   1
+clip_norm:    1.0
+
+# ── Loss ──────────────────────────────────────────────────────────────────
+lambda_ssim:      0.10
+lambda_wave:      0.05
+lambda_orth:      1.0e-4
+wave_loss_levels: 3
+
+# ── Schedule ──────────────────────────────────────────────────────────────
+epochs:       500
+total_steps:  500000
+warmup_steps: 2000
+batch_size:   4
+amp:          true
+
+# ── EMA ───────────────────────────────────────────────────────────────────
+ema:       true
+ema_decay: 0.999
+
+# ── Logging ───────────────────────────────────────────────────────────────
+val_freq:  5
+log_freq:  100
+save_freq: 10
+val_crop_size: 256     # center-crop HR to this size before eval
+
+# ── Paths ─────────────────────────────────────────────────────────────────
+ckpt_dir:      "checkpoints/div2k_x2"
+run_name:      "dwno_div2k_x2_mac"
+wandb:           true
+wandb_project:   "dwno-sr"
+wandb_num_images: 4
+
+device: "cuda"

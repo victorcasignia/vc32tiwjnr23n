@@ -194,9 +194,18 @@ def main():
                         help="Training steps per stage (default: %(default)s)")
     parser.add_argument("--lr", type=float, default=LR_RATE,
                         help="Learning rate (default: %(default)s)")
+    parser.add_argument("--device", default=None,
+                        help="Device override: mps / cuda / cpu")
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    default_device = (
+        "mps"
+        if torch.backends.mps.is_available()
+        else "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+    device = torch.device(args.device or default_device)
     print(f"Device: {device}  |  Optimizer: {args.optimizer}  |  Steps/stage: {args.steps}")
     print("=" * 60)
 
