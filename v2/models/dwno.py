@@ -156,7 +156,12 @@ class DWNOS(nn.Module):
         self.upsample = PixelShuffleUpsample(channels, scale)
 
         # ── Output refinement ────────────────────────────────────────────
-        self.refine = nn.Conv2d(channels, in_channels, 3, padding=1)
+        self.refine_body = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 3, padding=1),
+        )
+        self.refine_out = nn.Conv2d(channels, in_channels, 3, padding=1)
 
         # Init only normalization layers; all other modules keep their
         # per-module defaults (eye_ for SubbandOp, ICNR for upsample, etc.).
@@ -175,11 +180,16 @@ class DWNOS(nn.Module):
         x   : LR image  (B, 3, H, W)
         out : HR image  (B, 3, H*scale, W*scale)
         """
+        # Bicubic upsampled LR as global skip (stabilizes luminance & dark details)
+        lr_bicubic = F.interpolate(x, scale_factor=self.scale, mode="bicubic", align_corners=False)
+        
         feat_s  = self.shallow(x)           # (B, C, H, W)
         feat_d  = self.deep(feat_s)         # (B, C, H, W)
         feat    = feat_s + feat_d           # long skip
         feat_up = self.upsample(feat)       # (B, C, H*scale, W*scale)
-        return self.refine(feat_up)         # (B, 3, H*scale, W*scale)
+        feat_refined = feat_up + self.refine_body(feat_up)
+        residual = self.refine_out(feat_refined)  # (B, 3, H*scale, W*scale)
+        return residual + lr_bicubic        # global image skip
 
     def orthogonality_loss(self) -> torch.Tensor:
         """Auxiliary loss to keep learned lifting filters near bi-orthogonal."""
@@ -205,8 +215,8 @@ class WaveletLoss(nn.Module):
         levels: int = 3,
         weight_ll: float = 0.1,
         weight_edge: float = 1.0,
-        weight_diag: float = 1.5,
-        level_decay: float = 0.7,  # weight multiplier per coarser level
+        weight_diag: float = 2.0,   # Increased from 1.5 for stronger diagonal emphasis
+        level_decay: float = 0.7,   # weight multiplier per coarser level
     ):
         super().__init__()
         self.levels      = levels
@@ -333,16 +343,22 @@ class DWNOLoss(nn.Module):
     def __init__(
         self,
         lambda_ssim: float = 0.1,
-        lambda_wave: float = 0.05,
+        lambda_wave: float = 0.15,   # Increased from 0.05 for stronger HF supervision
         lambda_orth: float = 1e-4,
         wave_levels: int = 3,
+        wave_weight_edge: float = 1.0,
+        wave_weight_diag: float = 2.0,  # Exposed for config control
     ):
         super().__init__()
         self.lam_ssim = lambda_ssim
         self.lam_wave = lambda_wave
         self.lam_orth = lambda_orth
         self.ssim_fn  = SSIMLoss()
-        self.wave_fn  = WaveletLoss(levels=wave_levels)
+        self.wave_fn  = WaveletLoss(
+            levels=wave_levels,
+            weight_edge=wave_weight_edge,
+            weight_diag=wave_weight_diag,
+        )
 
     def forward(
         self,

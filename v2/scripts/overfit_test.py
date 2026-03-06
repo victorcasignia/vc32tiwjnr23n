@@ -29,6 +29,45 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.dwno import DWNOS, DWNOLoss
 from scripts.dataset import SRDataset
 from scripts.utils import psnr, ssim
+import torch
+import numpy as np
+import random
+import os
+
+def set_seed_all(seed):
+    """
+    Sets the seed for pseudo-random number generators in:
+    Python, NumPy, PyTorch (CPU and all GPUs).
+    Also configures PyTorch to use deterministic algorithms.
+    """
+    print(f"Setting random seed to {seed}")
+    
+    # Set seeds for standard libraries
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    
+    # Set seeds for PyTorch
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed) # For multi-GPU models
+    
+    # Configure deterministic algorithms
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Enforce deterministic algorithms for native kernels if available (PyTorch 1.12+)
+    # This might impact performance and may raise errors if no deterministic algo exists
+    # torch.use_deterministic_algorithms(True) 
+    
+    # Handle DataLoader workers for full reproducibility
+    # For fully deterministic data loading, a specific worker_init_fn is needed
+    # or set num_workers=0 in your DataLoader.
+
+# Example usage
+SEED = 43
+set_seed_all(SEED)
 
 
 # ── defaults ──────────────────────────────────────────────────────────────
@@ -118,7 +157,13 @@ def run_stage(
 
     # ── Training ──────────────────────────────────────────────────────────
     optimizer = _make_optimizer(model, optimizer_name, lr_rate)
-    criterion = DWNOLoss(lambda_ssim=0.1, lambda_wave=0.05, lambda_orth=1e-4).to(device)
+    criterion = DWNOLoss(
+        lambda_ssim=0.1,
+        lambda_wave=0.15,
+        lambda_orth=1e-4,
+        wave_weight_edge=1.0,
+        wave_weight_diag=2.0,
+    ).to(device)
 
     model.train()
     print(f"  {'Step':>5} | {'Loss':>8} | {'L1':>8} | {'PSNR':>8} | {'SSIM':>7}")

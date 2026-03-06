@@ -89,7 +89,7 @@ class StochasticDepth(nn.Module):
             return x
         keep  = 1.0 - self.drop_prob
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        mask  = torch.rand(shape, dtype=x.dtype, device=x.device).floor_().add_(keep).clamp_(0, 1)
+        mask  = torch.bernoulli(torch.full(shape, keep, dtype=x.dtype, device=x.device))
         return x * mask / keep
 
 
@@ -141,7 +141,7 @@ class SubbandConvBlock(nn.Module):
         self.act       = nn.GELU()
         self.grn       = GRN(hidden)
         self.fc2       = nn.Linear(hidden, dim)
-        self.gamma     = nn.Parameter(torch.ones(dim))
+        self.gamma     = nn.Parameter(torch.ones(dim) * 1e-6)  # layer-scale init near zero
         self.drop_path = StochasticDepth(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

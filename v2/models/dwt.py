@@ -154,8 +154,9 @@ class LiftingStep1D(nn.Module):
             # Apply along height: treat (B*W, C, H) as 1-D
             x2 = rearrange(x, "b c h w -> (b w) c h")
 
-        pad = self.filter_len // 2
-        x2 = F.pad(x2, (pad, pad), mode="circular")
+        pad_l = (self.filter_len - 1) // 2
+        pad_r = self.filter_len // 2
+        x2 = F.pad(x2, (pad_l, pad_r), mode="circular")
         # Depthwise conv: groups = C
         out = F.conv1d(x2, self.weight, self.bias, padding=0, groups=C)
 
@@ -178,8 +179,12 @@ class LiftingDWT1D(nn.Module):
 
     def __init__(self, channels: int, filter_len: int = 3):
         super().__init__()
-        self.P = LiftingStep1D(channels, "predict", filter_len)
-        self.U = LiftingStep1D(channels, "update",  filter_len)
+        predict_len = filter_len
+        # Use an even-length update filter for odd predict_len so the 2-tap
+        # LeGall update prototype stays naturally phase-aligned at init.
+        update_len = filter_len if (filter_len % 2 == 0) else max(2, filter_len - 1)
+        self.P = LiftingStep1D(channels, "predict", predict_len)
+        self.U = LiftingStep1D(channels, "update",  update_len)
 
     def forward(
         self, x: torch.Tensor, dim: int
@@ -379,13 +384,14 @@ class DWTForward2D(nn.Module):
 def wavelet_orthogonality_loss(model: nn.Module) -> torch.Tensor:
     """
     Encourage learned lifting filters to stay near a bi-orthogonal frame.
-    For each LiftingStep1D, compute: sum || w w^T - I ||_F  (per-channel mean).
+    For each LiftingStep1D, regularize per-channel filter norms to stay near 1.
+    This prevents wavelet drift while respecting the depthwise structure.
     """
     loss = torch.tensor(0.0)
     for m in model.modules():
         if isinstance(m, LiftingStep1D):
             W = m.weight.squeeze(1)   # (C, filter_len)
-            WWT = W @ W.t()
-            I   = torch.eye(W.shape[0], device=W.device)
-            loss = loss + (WWT - I).pow(2).mean()
+            # Per-channel L2 norm regularization: encourage ||w_c||_2 ≈ 1
+            norms = W.norm(dim=1)     # (C,)
+            loss = loss + (norms - 1.0).pow(2).mean()
     return loss

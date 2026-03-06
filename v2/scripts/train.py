@@ -254,10 +254,11 @@ def build_optimizer(model: nn.Module, cfg: dict) -> torch.optim.Optimizer:
         )
 
     # Split lifting-filter params to a lower LR group
+    # DWT lifting params are named: dwt.row.P.weight, dwt.row.U.weight, etc.
     lift_params  = [p for n, p in model.named_parameters()
-                    if "weight" in n and "lifting" in n.lower()]
+                    if "weight" in n and (".P.weight" in n or ".U.weight" in n)]
     other_params = [p for n, p in model.named_parameters()
-                    if not ("weight" in n and "lifting" in n.lower())]
+                    if not ("weight" in n and (".P.weight" in n or ".U.weight" in n))]
     param_groups = [
         {"params": other_params, "lr": lr},
         {"params": lift_params,  "lr": lr * 0.1, "name": "lifting"},
@@ -313,9 +314,11 @@ def train(cfg: dict):
     # ── Loss ─────────────────────────────────────────────────────────────
     criterion = DWNOLoss(
         lambda_ssim = cfg.get("lambda_ssim", 0.1),
-        lambda_wave = cfg.get("lambda_wave", 0.05),
+        lambda_wave = cfg.get("lambda_wave", 0.15),
         lambda_orth = cfg.get("lambda_orth", 1e-4),
         wave_levels = cfg.get("wave_loss_levels", 3),
+        wave_weight_edge = cfg.get("wave_weight_edge", 1.0),
+        wave_weight_diag = cfg.get("wave_weight_diag", 2.0),
     ).to(device)
 
     # ── Optimiser ────────────────────────────────────────────────────────

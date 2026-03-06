@@ -92,9 +92,9 @@ class WNOBlock(nn.Module):
           │  IDWT ────────────────────────────────────────────┤
           └──────────────────────────────────────────────────▶┴ GroupNorm → out
 
-    LH, HL, HH at the same level share a single SubbandConvBlock (weight
-    sharing by symmetry — all three capture directional detail at the same
-    scale).  LL gets its own block (distinct statistics).
+    LH/HL share a SubbandConvBlock per level, while HH gets its own block
+    (diagonal statistics differ from horizontal/vertical edges). LL gets its
+    own block (distinct coarse-scale statistics).
     """
 
     def __init__(
@@ -117,9 +117,14 @@ class WNOBlock(nn.Module):
         self.hl_ops = nn.ModuleList([SubbandOperator(channels) for _ in range(levels)])
         self.hh_ops = nn.ModuleList([SubbandOperator(channels) for _ in range(levels)])
 
-        # Local mixing blocks W_local — LL gets its own; HF subbands share per level
+        # Local mixing blocks W_local — LL gets its own.
+        # LH/HL share a block per level; HH gets a dedicated block per level.
         self.ll_block  = SubbandConvBlock(channels, kernel_size, mlp_ratio, drop_path)
         self.hf_blocks = nn.ModuleList([
+            SubbandConvBlock(channels, kernel_size, mlp_ratio, drop_path)
+            for _ in range(levels)
+        ])
+        self.hh_blocks = nn.ModuleList([
             SubbandConvBlock(channels, kernel_size, mlp_ratio, drop_path)
             for _ in range(levels)
         ])
@@ -139,9 +144,10 @@ class WNOBlock(nn.Module):
         new_highs = []
         for i, (LH, HL, HH) in enumerate(highs):
             blk = self.hf_blocks[i]
+            hh_blk = self.hh_blocks[i]
             LH  = blk(self.lh_ops[i](LH))
             HL  = blk(self.hl_ops[i](HL))
-            HH  = blk(self.hh_ops[i](HH))
+            HH  = hh_blk(self.hh_ops[i](HH))
             new_highs.append((LH, HL, HH))
 
         # ── IDWT + residual + norm ────────────────────────────────────────
@@ -207,6 +213,8 @@ class PixelShuffleUpsample(nn.Module):
             torch.empty(C_out // (s * s), C_in, *self.conv.weight.shape[2:])
         )
         self.conv.weight.data.copy_(small_w.repeat_interleave(s * s, dim=0))
+        # Zero bias for true nearest-neighbor-like behavior at init
+        nn.init.zeros_(self.conv.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.ps(self.conv(x))
