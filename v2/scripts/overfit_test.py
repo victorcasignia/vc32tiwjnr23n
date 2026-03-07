@@ -157,9 +157,15 @@ def run_stage(
 
     # ── Training ──────────────────────────────────────────────────────────
     optimizer = _make_optimizer(model, optimizer_name, lr_rate)
+    # best so far: 
+    # lambda_ssim=0.5,
+    # lambda_wave=0.25,
+    # lambda_sharp=0.1,
+    # lambda_orth=1e-4,
     criterion = DWNOLoss(
-        lambda_ssim=0.1,
-        lambda_wave=0.15,
+        lambda_ssim=0.5,
+        lambda_wave=0.25,
+        lambda_sharp=0.1,
         lambda_orth=1e-4,
         wave_weight_edge=1.0,
         wave_weight_diag=2.0,

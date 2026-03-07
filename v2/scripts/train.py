@@ -315,6 +315,7 @@ def train(cfg: dict):
     criterion = DWNOLoss(
         lambda_ssim = cfg.get("lambda_ssim", 0.1),
         lambda_wave = cfg.get("lambda_wave", 0.15),
+        lambda_sharp = cfg.get("lambda_sharp", 0.02),
         lambda_orth = cfg.get("lambda_orth", 1e-4),
         wave_levels = cfg.get("wave_loss_levels", 3),
         wave_weight_edge = cfg.get("wave_weight_edge", 1.0),

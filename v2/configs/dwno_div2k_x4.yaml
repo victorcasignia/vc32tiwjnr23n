@@ -39,6 +39,7 @@ muon_momentum:  0.95
 # ── Loss ──────────────────────────────────────────────────────────────────
 lambda_ssim:      0.10    # weight of (1 - SSIM) loss term
 lambda_wave:      0.15    # weight of wavelet-domain loss (increased from 0.05 for stronger HF)
+lambda_sharp:     0.02    # weight of Sobel-gradient sharpness loss (edge/detail emphasis)
 lambda_orth:      1.0e-4  # weight of lifting orthogonality regulariser
 wave_loss_levels: 3       # number of DWT levels used in wavelet loss
 wave_weight_edge: 1.0     # weight for LH/HL (horizontal/vertical edges)

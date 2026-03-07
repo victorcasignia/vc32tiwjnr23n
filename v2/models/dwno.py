@@ -328,15 +328,50 @@ class SSIMLoss(nn.Module):
         return 1.0 - self._ssim(x, y)
 
 
+class SharpnessLoss(nn.Module):
+    """
+    Sobel-gradient sharpness loss.
+    Penalizes mismatch in gradient magnitude between SR and HR.
+    """
+
+    def __init__(self):
+        super().__init__()
+        sobel_x = torch.tensor([
+            [-1.0, 0.0, 1.0],
+            [-2.0, 0.0, 2.0],
+            [-1.0, 0.0, 1.0],
+        ]).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([
+            [-1.0, -2.0, -1.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 2.0, 1.0],
+        ]).view(1, 1, 3, 3)
+        self.register_buffer("sobel_x", sobel_x)
+        self.register_buffer("sobel_y", sobel_y)
+
+    def _grad_mag(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        x_flat = x.reshape(B * C, 1, H, W)
+        gx = F.conv2d(x_flat, self.sobel_x, padding=1)
+        gy = F.conv2d(x_flat, self.sobel_y, padding=1)
+        gmag = torch.sqrt(gx.pow(2) + gy.pow(2) + 1e-12)
+        return gmag.reshape(B, C, H, W)
+
+    def forward(self, sr: torch.Tensor, hr: torch.Tensor) -> torch.Tensor:
+        return F.l1_loss(self._grad_mag(sr), self._grad_mag(hr))
+
+
 # ---------------------------------------------------------------------------
 # Combined Loss
 # ---------------------------------------------------------------------------
 
 class DWNOLoss(nn.Module):
     """
-    Combined loss: L1 + λ_ssim·SSIM + λ_wave·WaveletLoss + λ_orth·Orth
+    Combined loss: L1 + λ_ssim·SSIM + λ_wave·WaveletLoss
+                   + λ_sharp·Sharpness + λ_orth·Orth
 
     λ_wave penalises wavelet-domain errors (especially HF subbands).
+    λ_sharp penalises gradient-magnitude mismatch for sharper edges.
     λ_orth regularises learnable lifting filters toward bi-orthogonal frames.
     """
 
@@ -344,6 +379,7 @@ class DWNOLoss(nn.Module):
         self,
         lambda_ssim: float = 0.1,
         lambda_wave: float = 0.15,   # Increased from 0.05 for stronger HF supervision
+        lambda_sharp: float = 0.02,
         lambda_orth: float = 1e-4,
         wave_levels: int = 3,
         wave_weight_edge: float = 1.0,
@@ -352,8 +388,10 @@ class DWNOLoss(nn.Module):
         super().__init__()
         self.lam_ssim = lambda_ssim
         self.lam_wave = lambda_wave
+        self.lam_sharp = lambda_sharp
         self.lam_orth = lambda_orth
         self.ssim_fn  = SSIMLoss()
+        self.sharp_fn = SharpnessLoss()
         self.wave_fn  = WaveletLoss(
             levels=wave_levels,
             weight_edge=wave_weight_edge,
@@ -369,18 +407,26 @@ class DWNOLoss(nn.Module):
         l1   = F.l1_loss(sr, hr)
         ssim = self.ssim_fn(sr, hr)
         wave = self.wave_fn(sr, hr)
+        sharp = self.sharp_fn(sr, hr)
         orth = (
             wavelet_orthogonality_loss(model)
             if model is not None and self.lam_orth > 0
             else torch.tensor(0.0, device=sr.device)
         )
 
-        total = l1 + self.lam_ssim * ssim + self.lam_wave * wave + self.lam_orth * orth
+        total = (
+            l1
+            + self.lam_ssim * ssim
+            + self.lam_wave * wave
+            + self.lam_sharp * sharp
+            + self.lam_orth * orth
+        )
 
         return total, {
             "loss_total": total.item(),
             "loss_l1":    l1.item(),
             "loss_ssim":  ssim.item(),
             "loss_wave":  wave.item(),
+            "loss_sharp": sharp.item(),
             "loss_orth":  orth.item() if torch.is_tensor(orth) else 0.0,
         }
