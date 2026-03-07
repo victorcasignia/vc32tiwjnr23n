@@ -171,6 +171,7 @@ class WNOStage(nn.Module):
         mlp_ratio: float = 4.0,
         drop_path: float = 0.0,
         filter_len: int = 3,
+        stage_res_init: float = 0.1,
     ):
         super().__init__()
         # Linearly increasing drop_path rate across blocks in stage
@@ -179,11 +180,14 @@ class WNOStage(nn.Module):
             WNOBlock(channels, levels, kernel_size, mlp_ratio, dp_rates[i], filter_len)
             for i in range(depth)
         ])
+        self.stage_scale = nn.Parameter(torch.tensor(float(stage_res_init)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        stage_in = x
         for blk in self.blocks:
             x = blk(x)
-        return x
+        stage_delta = x - stage_in
+        return stage_in + self.stage_scale * stage_delta
 
 
 # ---------------------------------------------------------------------------

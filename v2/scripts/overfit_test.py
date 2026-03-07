@@ -66,7 +66,7 @@ def set_seed_all(seed):
     # or set num_workers=0 in your DataLoader.
 
 # Example usage
-SEED = 43
+SEED = 42
 set_seed_all(SEED)
 
 
