@@ -19,6 +19,7 @@ Run:
 
 import sys
 from pathlib import Path
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -29,18 +30,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from models.dwno import DWNOS, DWNOLoss
 from scripts.dataset import SRDataset
 from scripts.utils import psnr, ssim
-import torch
 import numpy as np
 import random
 import os
 
-def set_seed_all(seed):
+def set_seed_all(seed: int, verbose: bool = True):
     """
     Sets the seed for pseudo-random number generators in:
     Python, NumPy, PyTorch (CPU and all GPUs).
     Also configures PyTorch to use deterministic algorithms.
     """
-    print(f"Setting random seed to {seed}")
+    if verbose:
+        print(f"Setting random seed to {seed}")
     
     # Set seeds for standard libraries
     random.seed(seed)
@@ -65,9 +66,7 @@ def set_seed_all(seed):
     # For fully deterministic data loading, a specific worker_init_fn is needed
     # or set num_workers=0 in your DataLoader.
 
-# Example usage
 SEED = 42
-set_seed_all(SEED)
 
 
 # ── defaults ──────────────────────────────────────────────────────────────
@@ -78,6 +77,16 @@ LR_RATE          = 5e-4
 N_STEPS          = 200
 LOG_EVERY        = 10
 PASS_THRESHOLD   = 1.0       # minimum gain (dB) over bicubic to pass a stage
+LAMBDA_STEP      = 0.05
+
+DEFAULT_LOSS_CFG = {
+    "lambda_ssim": 0.9,
+    "lambda_wave": 0.1,
+    "lambda_sharp": 0.4,
+    "lambda_orth": 1e-4,
+    "wave_weight_edge": 1.0,
+    "wave_weight_diag": 2.0,
+}
 
 # Stage definitions: (n_images, n_steps)
 STAGES = [
@@ -115,6 +124,8 @@ def run_stage(
     patch_size: int  = PATCH_SIZE,
     lr_rate: float   = LR_RATE,
     log_every: int   = LOG_EVERY,
+    loss_cfg: Optional[Dict[str, float]] = None,
+    verbose: bool = True,
 ) -> dict:
     """Train on n_images patches for n_steps steps. Returns result dict."""
 
@@ -153,27 +164,27 @@ def run_stage(
         bicubic  = F.interpolate(lr_img, scale_factor=scale, mode="bicubic", align_corners=False)
         bic_psnr = psnr(bicubic.clamp(0, 1), hr_img)
 
-    print(f"  Params: {n_params:.2f}M   Bicubic baseline: {bic_psnr:.2f} dB")
+    if verbose:
+        print(f"  Params: {n_params:.2f}M   Bicubic baseline: {bic_psnr:.2f} dB")
 
     # ── Training ──────────────────────────────────────────────────────────
     optimizer = _make_optimizer(model, optimizer_name, lr_rate)
-    # best so far: 
-    # lambda_ssim=0.5,
-    # lambda_wave=0.25,
-    # lambda_sharp=0.1,
-    # lambda_orth=1e-4,
+    cfg = dict(DEFAULT_LOSS_CFG)
+    if loss_cfg is not None:
+        cfg.update(loss_cfg)
     criterion = DWNOLoss(
-        lambda_ssim=0.5,
-        lambda_wave=0.25,
-        lambda_sharp=0.1,
-        lambda_orth=1e-4,
-        wave_weight_edge=1.0,
-        wave_weight_diag=2.0,
+        lambda_ssim=cfg["lambda_ssim"],
+        lambda_wave=cfg["lambda_wave"],
+        lambda_sharp=cfg["lambda_sharp"],
+        lambda_orth=cfg["lambda_orth"],
+        wave_weight_edge=cfg["wave_weight_edge"],
+        wave_weight_diag=cfg["wave_weight_diag"],
     ).to(device)
 
     model.train()
-    print(f"  {'Step':>5} | {'Loss':>8} | {'L1':>8} | {'PSNR':>8} | {'SSIM':>7}")
-    print("  " + "-" * 50)
+    if verbose:
+        print(f"  {'Step':>5} | {'Loss':>8} | {'L1':>8} | {'PSNR':>8} | {'SSIM':>7}")
+        print("  " + "-" * 50)
 
     for step in range(1, n_steps + 1):
         sr         = model(lr_img)
@@ -183,7 +194,7 @@ def run_stage(
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
-        if step % log_every == 0 or step == 1:
+        if verbose and (step % log_every == 0 or step == 1):
             with torch.no_grad():
                 sr_e = model(lr_img).clamp(0, 1)
                 p    = psnr(sr_e, hr_img)
@@ -201,9 +212,10 @@ def run_stage(
     gain   = final_psnr - bic_psnr
     passed = gain >= PASS_THRESHOLD
 
-    print(f"\n  Final PSNR : {final_psnr:.2f} dB  "
-          f"(bicubic: {bic_psnr:.2f} dB,  gain: {gain:+.2f} dB)")
-    print(f"  Final SSIM : {final_ssim:.4f}")
+    if verbose:
+        print(f"\n  Final PSNR : {final_psnr:.2f} dB  "
+              f"(bicubic: {bic_psnr:.2f} dB,  gain: {gain:+.2f} dB)")
+        print(f"  Final SSIM : {final_ssim:.4f}")
 
     # ── Save sample images ────────────────────────────────────────────────
     try:
@@ -215,9 +227,11 @@ def run_stage(
                                   mode="bicubic", align_corners=False).clamp(0, 1)
             row = torch.cat([lr_up, sr_final[i:i+1], hr_img[i:i+1]], dim=3)
             save_image(row[0], out_dir / f"sample_{i}_lr_sr_hr.png")
-        print(f"  Images     → {out_dir.resolve()}")
+        if verbose:
+            print(f"  Images     → {out_dir.resolve()}")
     except Exception as e:
-        print(f"  (image save skipped: {e})")
+        if verbose:
+            print(f"  (image save skipped: {e})")
 
     return {
         "n_images":   n_images,
@@ -227,6 +241,166 @@ def run_stage(
         "ssim":       final_ssim,
         "passed":     passed,
     }
+
+
+def _q05(value: float) -> float:
+    value = max(0.0, min(1.0, value))
+    return round(round(value / LAMBDA_STEP) * LAMBDA_STEP, 2)
+
+
+def _random_candidate(rng: random.Random) -> Dict[str, float]:
+    return {
+        "lambda_ssim": _q05(rng.uniform(0.0, 1.0)),
+        "lambda_wave": _q05(rng.uniform(0.0, 1.0)),
+        "lambda_sharp": _q05(rng.uniform(0.0, 1.0)),
+    }
+
+
+def _crossover(a: Dict[str, float], b: Dict[str, float], rng: random.Random) -> Dict[str, float]:
+    return {
+        key: a[key] if rng.random() < 0.5 else b[key]
+        for key in ("lambda_ssim", "lambda_wave", "lambda_sharp")
+    }
+
+
+def _mutate(candidate: Dict[str, float], rng: random.Random, mutation_prob: float) -> Dict[str, float]:
+    out = dict(candidate)
+    for key in ("lambda_ssim", "lambda_wave", "lambda_sharp"):
+        if rng.random() < mutation_prob:
+            delta = rng.choice([-LAMBDA_STEP, LAMBDA_STEP])
+            out[key] = _q05(out[key] + delta)
+    return out
+
+
+def _candidate_key(candidate: Dict[str, float]) -> tuple:
+    return (
+        candidate["lambda_ssim"],
+        candidate["lambda_wave"],
+        candidate["lambda_sharp"],
+    )
+
+
+def evaluate_candidate(
+    candidate: Dict[str, float],
+    optimizer_name: str,
+    device: torch.device,
+    scale: int,
+    patch_size: int,
+    lr_rate: float,
+    n_images: int,
+    n_steps: int,
+    seeds: List[int],
+) -> Dict[str, object]:
+    psnrs = []
+    ssims = []
+    gains = []
+
+    for seed in seeds:
+        set_seed_all(seed, verbose=False)
+        result = run_stage(
+            n_images=n_images,
+            n_steps=n_steps,
+            optimizer_name=optimizer_name,
+            device=device,
+            scale=scale,
+            patch_size=patch_size,
+            lr_rate=lr_rate,
+            loss_cfg={
+                **DEFAULT_LOSS_CFG,
+                **candidate,
+            },
+            verbose=True,
+        )
+        psnrs.append(result["final_psnr"])
+        ssims.append(result["ssim"])
+        gains.append(result["gain"])
+
+    return {
+        "candidate": candidate,
+        "psnr_mean": float(np.mean(psnrs)),
+        "ssim_mean": float(np.mean(ssims)),
+        "gain_mean": float(np.mean(gains)),
+        "psnrs": psnrs,
+    }
+
+
+def search_lambdas_ga(
+    optimizer_name: str,
+    device: torch.device,
+    scale: int,
+    patch_size: int,
+    lr_rate: float,
+    n_images: int,
+    n_steps: int,
+    seeds: List[int],
+    pop_size: int,
+    generations: int,
+    elites: int,
+    mutation_prob: float,
+    rng_seed: int = 42,
+) -> Dict[str, object]:
+    rng = random.Random(rng_seed)
+
+    population = [
+        {
+            "lambda_ssim": _q05(DEFAULT_LOSS_CFG["lambda_ssim"]),
+            "lambda_wave": _q05(DEFAULT_LOSS_CFG["lambda_wave"]),
+            "lambda_sharp": _q05(DEFAULT_LOSS_CFG["lambda_sharp"]),
+        }
+    ]
+    while len(population) < pop_size:
+        cand = _random_candidate(rng)
+        if _candidate_key(cand) not in {_candidate_key(x) for x in population}:
+            population.append(cand)
+
+    best = None
+
+    for gen in range(1, generations + 1):
+        scored = []
+        for cand in population:
+            scored.append(
+                evaluate_candidate(
+                    candidate=cand,
+                    optimizer_name=optimizer_name,
+                    device=device,
+                    scale=scale,
+                    patch_size=patch_size,
+                    lr_rate=lr_rate,
+                    n_images=n_images,
+                    n_steps=n_steps,
+                    seeds=seeds,
+                )
+            )
+
+        scored.sort(key=lambda x: x["psnr_mean"], reverse=True)
+        best = scored[0]
+        print(
+            f"[GA] Gen {gen}/{generations} best PSNR={best['psnr_mean']:.3f} "
+            f"lambdas={best['candidate']} seeds={seeds}"
+        )
+
+        elites_now = [x["candidate"] for x in scored[:elites]]
+        parent_pool = [x["candidate"] for x in scored[: max(elites, pop_size // 2)]]
+
+        next_pop = list(elites_now)
+        used = {_candidate_key(c) for c in next_pop}
+
+        while len(next_pop) < pop_size:
+            p1 = rng.choice(parent_pool)
+            p2 = rng.choice(parent_pool)
+            child = _crossover(p1, p2, rng)
+            child = _mutate(child, rng, mutation_prob)
+            if _candidate_key(child) in used:
+                child = _mutate(child, rng, 1.0)
+            if _candidate_key(child) in used:
+                child = _random_candidate(rng)
+            if _candidate_key(child) not in used:
+                next_pop.append(child)
+                used.add(_candidate_key(child))
+
+        population = next_pop
+
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +421,22 @@ def main():
                         help="Learning rate (default: %(default)s)")
     parser.add_argument("--device", default=None,
                         help="Device override: mps / cuda / cpu")
+    parser.add_argument("--search-lambdas", action="store_true",
+                        help="Run GA search for lambda_ssim/lambda_wave/lambda_sharp")
+    parser.add_argument("--search-images", type=int, default=4,
+                        help="Number of images per candidate evaluation (default: 4)")
+    parser.add_argument("--search-steps", type=int, default=80,
+                        help="Training steps per candidate evaluation (default: 80)")
+    parser.add_argument("--ga-pop-size", type=int, default=8,
+                        help="GA population size (default: 8)")
+    parser.add_argument("--ga-generations", type=int, default=5,
+                        help="GA generations (default: 5)")
+    parser.add_argument("--ga-elites", type=int, default=2,
+                        help="Number of elites to keep each generation (default: 2)")
+    parser.add_argument("--ga-mutation-prob", type=float, default=0.5,
+                        help="Per-lambda mutation probability (default: 0.5)")
+    parser.add_argument("--search-seeds", type=str, default="42,43",
+                        help="Comma-separated seeds for candidate scoring (default: 42,43)")
     args = parser.parse_args()
 
     default_device = (
@@ -257,7 +447,39 @@ def main():
         else "cpu"
     )
     device = torch.device(args.device or default_device)
+    set_seed_all(SEED)
     print(f"Device: {device}  |  Optimizer: {args.optimizer}  |  Steps/stage: {args.steps}")
+
+    if args.search_lambdas:
+        seeds = [int(s.strip()) for s in args.search_seeds.split(",") if s.strip()]
+        if seeds != [42, 43]:
+            print(f"[GA] Using provided seeds: {seeds}")
+        else:
+            print("[GA] Using seeds: [42, 43]")
+
+        best = search_lambdas_ga(
+            optimizer_name=args.optimizer,
+            device=device,
+            scale=SCALE,
+            patch_size=PATCH_SIZE,
+            lr_rate=args.lr,
+            n_images=args.search_images,
+            n_steps=args.search_steps,
+            seeds=seeds,
+            pop_size=args.ga_pop_size,
+            generations=args.ga_generations,
+            elites=args.ga_elites,
+            mutation_prob=args.ga_mutation_prob,
+            rng_seed=42,
+        )
+        print("=" * 60)
+        print("Best lambda set found")
+        print("-" * 60)
+        print(f"lambdas={best['candidate']}")
+        print(f"mean PSNR={best['psnr_mean']:.4f}  mean gain={best['gain_mean']:.4f}")
+        print(f"seed-wise PSNR={best['psnrs']}")
+        return
+
     print("=" * 60)
 
     results    = []
